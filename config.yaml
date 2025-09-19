@@ -1,0 +1,210 @@
+# Traffic Sign Recognition Configuration File
+# Modify these settings according to your needs
+
+# Dataset Configuration
+dataset:
+  path: "Dataset"
+  train_split: 0.8  # 80% for training, 20% for validation
+  val_from_train: true  # If true, validation data is taken from training set
+  image_formats: [".jpg", ".jpeg", ".png"]
+  min_images_per_class: 5
+
+# Training Configuration
+training:
+  model: "yolo11s.pt"  # Options: yolo11n.pt, yolo11s.pt, yolo11m.pt, yolo11l.pt, yolo11x.pt
+  epochs: 100
+  batch_size: 16
+  image_size: 640
+  patience: 20  # Early stopping patience
+  
+  # Model saving configuration
+  save_period: 10  # Save checkpoint every N epochs
+  save_best: true  # Save best model based on validation metric
+  save_last: true  # Save last model
+  save_generic_names: true  # Save copies with generic names (best_model.pt, last_model.pt)
+  
+  # Augmentation settings
+  augment: true
+  hsv_h: 0.015  # HSV-Hue augmentation
+  hsv_s: 0.7    # HSV-Saturation augmentation
+  hsv_v: 0.4    # HSV-Value augmentation
+  degrees: 0.0  # Image rotation
+  translate: 0.1  # Image translation
+  scale: 0.5     # Image scaling
+  shear: 0.0     # Image shear
+  perspective: 0.0  # Perspective transform
+  flipud: 0.0    # Vertical flip probability
+  fliplr: 0.5    # Horizontal flip probability
+  mosaic: 1.0    # Mosaic augmentation probability
+  mixup: 0.0     # Mixup augmentation probability
+
+# Inference Configuration
+inference:
+  confidence_threshold: 0.4
+  nms_threshold: 0.45
+  max_detections: 100
+  
+  # Preprocessing for low visibility
+  enable_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+
+# Priority System Configuration
+priorities:
+  # Critical signs (Priority 10)
+  critical:
+    - "STOP"
+    - "NO_ENTRY"
+  
+  # High importance (Priority 9)
+  high:
+    - "GIVE_WAY"
+  
+  # Speed limits (Priority 8)
+  speed_limits:
+    - "SPEED_LIMIT_5"
+    - "SPEED_LIMIT_15"
+    - "SPEED_LIMIT_20"
+    - "SPEED_LIMIT_30"
+    - "SPEED_LIMIT_40"
+    - "SPEED_LIMIT_50"
+    - "SPEED_LIMIT_60"
+    - "SPEED_LIMIT_70"
+    - "SPEED_LIMIT_80"
+  
+  # Safety signs (Priority 7)
+  safety:
+    - "SCHOOL_AHEAD"
+    - "PEDESTRIAN_CROSSING"
+  
+  # Parking restrictions (Priority 6)
+  parking:
+    - "NO_PARKING"
+    - "NO_STOPPING_OR_STANDING"
+  
+  # Turn restrictions (Priority 5)
+  turns:
+    - "LEFT_TURN_PROHIBITED"
+    - "RIGHT_TURN_PROHIBITED"
+    - "U_TURN_PROHIBITED"
+    - "OVERTAKING_PROHIBITED"
+  
+  # Vehicle restrictions (Priority 4)
+  vehicles:
+    - "HORN_PROHIBITED"
+    - "CYCLE_PROHIBITED"
+    - "PEDESTRIAN_PROHIBITED"
+  
+  # Directional signs (Priority 3)
+  directional:
+    - "COMPULSARY_AHEAD"
+    - "COMPULSARY_TURN_LEFT"
+    - "COMPULSARY_TURN_RIGHT"
+    - "COMPULSARY_KEEP_LEFT"
+    - "COMPULSARY_KEEP_RIGHT"
+  
+  # Warning signs (Priority 2)
+  warnings:
+    - "BARRIER_AHEAD"
+    - "CATTLE"
+    - "CROSS_ROAD"
+    - "DANGEROUS_DIP"
+    - "FALLING_ROCKS"
+    - "HUMP_OR_ROUGH_ROAD"
+    - "LEFT_HAIR_PIN_BEND"
+    - "LEFT_HAND_CURVE"
+    - "LEFT_REVERSE_BEND"
+    - "LOOSE_GRAVEL"
+    - "MEN_AT_WORK"
+    - "NARROW_BRIDGE"
+    - "NARROW_ROAD_AHEAD"
+    - "RIGHT_HAIR_PIN_BEND"
+    - "RIGHT_HAND_CURVE"
+    - "RIGHT_REVERSE_BEND"
+    - "ROAD_WIDENS_AHEAD"
+    - "ROUNDABOUT"
+    - "SIDE_ROAD_LEFT"
+    - "SIDE_ROAD_RIGHT"
+    - "SLIPPERY_ROAD"
+    - "STAGGERED_INTERSECTION"
+    - "STEEP_ASCENT"
+    - "STEEP_DESCENT"
+    - "T_INTERSECTION"
+    - "UNGUARDED_LEVEL_CROSSING"
+    - "Y_INTERSECTION"
+
+# Alert System Configuration
+alerts:
+  # Visual alert settings
+  visual:
+    enable: true
+    font_scale: 1.2
+    font_thickness: 3
+    alert_color: [0, 0, 255]  # Red color for alerts
+  
+  # Audio alert settings (if implemented)
+  audio:
+    enable: false
+    audio_folder: "audio_alerts"
+    volume: 0.8
+
+# Output Configuration
+output:
+  path: "output"
+  save_detections: true
+  save_format: "jpg"
+  save_annotations: true
+  
+  # Export settings
+  export:
+    formats: ["onnx", "tensorrt", "coreml"]
+    optimize: true
+    half_precision: true
+
+# Performance Configuration
+performance:
+  # GPU settings
+  gpu:
+    enable: true
+    device: "auto"  # "auto", "cpu", "0", "1", etc.
+    memory_fraction: 0.8
+  
+  # Threading
+  threads: 4
+  
+  # Memory management
+  max_memory_usage: 0.8  # 80% of available memory
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  save_logs: true
+  log_file: "traffic_sign_recognition.log"
+  
+  # TensorBoard logging
+  tensorboard:
+    enable: true
+    log_dir: "runs/tensorboard"
+
+# Validation Configuration
+validation:
+  # Validation metrics
+  metrics:
+    - "mAP50"
+    - "mAP50-95"
+    - "precision"
+    - "recall"
+    - "f1"
+  
+  # Validation frequency
+  val_frequency: 1  # Validate every N epochs
+  
+  # Save best model based on
+  save_best_metric: "mAP50"
+
+# Custom Classes (if you want to add more classes)
+custom_classes:
+  # Add your custom traffic sign classes here
+  # Example:
+  # - "CUSTOM_SIGN_1"
+  # - "CUSTOM_SIGN_2" 
