@@ -327,11 +327,15 @@ class TrafficSignRecognition:
         except Exception as e:
             logger.warning(f"Could not clear label cache files: {e}")
 
-        # Create unique model name with timestamp
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_name = f"traffic_sign_model_{timestamp}"
-        
+        # Set the fixed folder name for the model
+        model_name = "traffic_sign_model"
+        model_path = self.output_path / model_name
+
+        # Remove the existing folder if it exists
+        if model_path.exists() and model_path.is_dir():
+            logger.info(f"Removing existing folder: {model_path}")
+            shutil.rmtree(model_path)
+
         # Train the model with GPU optimization. If CUDA/memory error occurs, retry with safer settings.
         try:
             results = self.model.train(
@@ -388,8 +392,8 @@ class TrafficSignRecognition:
                 raise
         
         # Get the best model path
-        best_model_path = self.output_path / model_name / "weights" / "best.pt"
-        last_model_path = self.output_path / model_name / "weights" / "last.pt"
+        best_model_path = model_path / "weights" / "best.pt"
+        last_model_path = model_path / "weights" / "last.pt"
         
         # Also save a copy with a generic name for easy access
         generic_best_path = self.output_path / "best_model.pt"
@@ -507,8 +511,12 @@ class TrafficSignRecognition:
         Args:
             model_path: Path to the trained model
         """
+        model_path = Path(model_path)  # Ensure model_path is a Path object
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found at: {model_path}. Please ensure the model file exists.")
+        
         logger.info(f"Loading model from {model_path}")
-        self.model = YOLO(model_path)
+        self.model = YOLO(str(model_path))
     
     def process_frame(self, frame: np.ndarray, conf_threshold: float = 0.5) -> List[Tuple]:
         """

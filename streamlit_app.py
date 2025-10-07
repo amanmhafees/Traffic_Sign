@@ -5,6 +5,7 @@ from PIL import Image
 import tempfile
 import os
 from traffic_sign_recognition import TrafficSignRecognition
+import time
 
 # Add the current directory to the Python path
 import sys
@@ -27,6 +28,10 @@ model_path = st.sidebar.text_input(
 conf_threshold = st.sidebar.slider(
     "Confidence threshold", min_value=0.1, max_value=1.0, value=0.4, step=0.05
 )
+max_display_height = st.sidebar.number_input(
+    "Max display image height (px)",
+    min_value=200, max_value=1200, value=500, step=50
+)
 
 # Language selection for audio alerts
 notification_handler = NotificationHandler()
@@ -37,6 +42,17 @@ selected_languages = st.sidebar.multiselect(
     default=["en", "hi"],  # Default to English and Hindi
     format_func=lambda lang: Language.get(lang).display_name()  # Convert language code to full name
 )
+
+# Session state for preventing repeat audio per sign
+if "announced_signs" not in st.session_state:
+    st.session_state["announced_signs"] = set()
+
+# Cleanup old custom notification placeholders (time-based)
+now_ts = time.time() if "time" in dir() else __import__("time").time()
+for k in list(st.session_state.keys()):
+    if k.endswith("_ts"):
+        if now_ts - st.session_state[k] > 3.5:
+            del st.session_state[k]
 
 # Load model (cache for performance)
 @st.cache_resource(show_spinner=True)
@@ -71,7 +87,17 @@ if uploaded_file is not None:
 
     # Show results
     st.subheader("Detection Results")
-    st.image(result_img_rgb, caption="Detected Traffic Signs", use_container_width=True)
+    def resize_for_display(img_rgb, max_h: int):
+        # Preserve aspect ratio; only downscale if taller than max_h
+        h, w = img_rgb.shape[:2]
+        if h <= max_h:
+            return img_rgb
+        scale = max_h / h
+        new_w = int(w * scale)
+        import cv2 as _cv2
+        return _cv2.resize(img_rgb, (new_w, max_h), interpolation=_cv2.INTER_AREA)
+    display_img = resize_for_display(result_img_rgb, max_display_height)
+    st.image(display_img, caption="Detected Traffic Signs")
 
     # Show detection details and play audio alerts
     if detections:
@@ -79,18 +105,9 @@ if uploaded_file is not None:
         for i, (cls_name, conf_score, bbox, area) in enumerate(detections):
             x1, y1, x2, y2 = bbox
             st.write(f"{i+1}. **{cls_name}** (Confidence: {conf_score:.2f}) [Box: ({x1},{y1})-({x2},{y2})]")
-            
-            # Display a temporary notification using a placeholder
-            notification_placeholder = st.empty()
-            notification_placeholder.success(f"🔔 Detected: {cls_name}")
-            
-            # Close the notification after 5 seconds
-            import time
-            time.sleep(5)
-            notification_placeholder.empty()
-
-            # Play audio alert for detected sign
-            notification_handler.notify_traffic_sign(cls_name, selected_languages)
+            if cls_name not in st.session_state["announced_signs"]:
+                notification_handler.notify_traffic_sign(cls_name, selected_languages)
+                st.session_state["announced_signs"].add(cls_name)
     else:
         st.info("No traffic signs detected with the current confidence threshold.")
 else:
