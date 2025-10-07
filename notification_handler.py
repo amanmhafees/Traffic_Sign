@@ -17,6 +17,10 @@ try:
     import winsound  # Windows beep
 except Exception:
     winsound = None
+try:
+    from playsound import playsound  # optional fallback
+except Exception:
+    playsound = None
 import threading
 
 # Configure logging
@@ -36,6 +40,8 @@ class NotificationHandler:
         self.enable_popup_sound = True  # set False to disable popup chime
         self.background_autoplay = True  # new: enable background autoplay of first selected language
         self.hide_autoplay_player = True  # new: hide the widget for the auto‑played language
+        # Track whether any backend can really autoplay
+        self._last_autoplay_ok = False
         self.audio_dir = self.output_path / "audio_alerts"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.available_languages = [
@@ -231,7 +237,7 @@ class NotificationHandler:
 
     def _play_audio_async(self, audio_path: Path):
         """
-        Play audio asynchronously (non-blocking) using pydub.
+        (Legacy) pydub-only async playback.
         """
         if not self.use_pydub:
             return
@@ -242,6 +248,37 @@ class NotificationHandler:
             except Exception as e:
                 logger.warning(f"Async playback failed for {audio_path.name}: {e}")
         threading.Thread(target=_runner, daemon=True).start()
+
+    def _background_autoplay(self, first_path: Path) -> bool:
+        """
+        Unified background autoplay attempt.
+        Returns True if playback likely started.
+        Order: pydub -> playsound -> (fail)
+        """
+        # Try pydub (needs ffmpeg)
+        if self.use_pydub:
+            try:
+                self._play_audio_async(first_path)
+                logger.debug(f"Autoplay via pydub started: {first_path.name}")
+                return True
+            except Exception as e:
+                logger.warning(f"pydub autoplay failed ({first_path.name}): {e}")
+        # Try playsound (blocking by default; run in thread)
+        if playsound:
+            try:
+                def _ps():
+                    try:
+                        playsound(str(first_path))
+                    except Exception as ie:
+                        logger.warning(f"playsound failed ({first_path.name}): {ie}")
+                threading.Thread(target=_ps, daemon=True).start()
+                logger.debug(f"Autoplay via playsound started: {first_path.name}")
+                return True
+            except Exception as e:
+                logger.warning(f"playsound autoplay error ({first_path.name}): {e}")
+        # No backend
+        logger.info("No suitable backend for background autoplay (ffmpeg & playsound missing).")
+        return False
 
     def notify_traffic_sign(self, detected_sign: str, languages: Optional[List[str]] = None):
         """
@@ -278,15 +315,12 @@ class NotificationHandler:
         # Background autoplay of first selected language if possible
         first_lang, first_path = preferred_first
         autoplay_success = False
-        if self.background_autoplay and self.use_pydub:
-            try:
-                self._play_audio_async(first_path)
-                autoplay_success = True
-            except Exception as e:
-                logger.warning(f"Background autoplay failed, will show player: {e}")
+        if self.background_autoplay:
+            autoplay_success = self._background_autoplay(first_path)
+        self._last_autoplay_ok = autoplay_success
 
         if not autoplay_success:
-            # Show player for first even if hiding is configured, because autoplay didn’t truly happen
+            # Show player for first always if autoplay not successful
             try:
                 with open(first_path, "rb") as f:
                     st.audio(f.read(), format="audio/mp3")
@@ -306,7 +340,10 @@ class NotificationHandler:
                 with open(path, "rb") as f:
                     with cols[i % len(cols)]:
                         st.audio(f.read(), format="audio/mp3")
-                        st.caption(lang + (" (auto)" if autoplay_success and lang == first_lang else ""))
+                        tag = ""
+                        if autoplay_success and lang == first_lang:
+                            tag = " (auto)"
+                        st.caption(lang + tag)
             except Exception as e:
                 logger.warning(f"Could not load audio player for {path.name}: {e}")
 
