@@ -6,6 +6,7 @@ import tempfile
 import os
 from traffic_sign_recognition import TrafficSignRecognition
 import time
+import hashlib
 
 # Add the current directory to the Python path
 import sys
@@ -44,6 +45,8 @@ selected_languages = st.sidebar.multiselect(
 )
 
 # Session state for preventing repeat audio per sign
+if "last_upload_hash" not in st.session_state:
+    st.session_state["last_upload_hash"] = None
 if "announced_signs" not in st.session_state:
     st.session_state["announced_signs"] = set()
 
@@ -67,6 +70,14 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+    # Compute hash of current upload
+    file_bytes = uploaded_file.getvalue()
+    current_hash = hashlib.sha256(file_bytes).hexdigest()
+    if st.session_state["last_upload_hash"] != current_hash:
+        # New image => reset suppression so alerts/audio re-trigger
+        st.session_state["announced_signs"].clear()
+        st.session_state["last_upload_hash"] = current_hash
+
     # Read image
     image = Image.open(uploaded_file).convert("RGB")
     img_np = np.array(image)
@@ -105,9 +116,14 @@ if uploaded_file is not None:
         for i, (cls_name, conf_score, bbox, area) in enumerate(detections):
             x1, y1, x2, y2 = bbox
             st.write(f"{i+1}. **{cls_name}** (Confidence: {conf_score:.2f}) [Box: ({x1},{y1})-({x2},{y2})]")
-            if cls_name not in st.session_state["announced_signs"]:
-                notification_handler.notify_traffic_sign(cls_name, selected_languages)
-                st.session_state["announced_signs"].add(cls_name)
+            # Always notify on each image upload (suppression only within the same single image if desired)
+            # Option A: allow repeats for same sign inside same image -> just call notify directly:
+            notification_handler.notify_traffic_sign(cls_name, selected_languages)
+
+            # Option B (keep single notification per sign per image):
+            # if cls_name not in st.session_state["announced_signs"]:
+            #     notification_handler.notify_traffic_sign(cls_name, selected_languages)
+            #     st.session_state["announced_signs"].add(cls_name)
     else:
         st.info("No traffic signs detected with the current confidence threshold.")
 else:

@@ -17,6 +17,7 @@ try:
     import winsound  # Windows beep
 except Exception:
     winsound = None
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,6 +34,8 @@ class NotificationHandler:
         self.output_path = Path(output_path)
         # Add missing flag for popup sound (prevents AttributeError)
         self.enable_popup_sound = True  # set False to disable popup chime
+        self.background_autoplay = True  # new: enable background autoplay of first selected language
+        self.hide_autoplay_player = True  # new: hide the widget for the auto‑played language
         self.audio_dir = self.output_path / "audio_alerts"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.available_languages = [
@@ -226,172 +229,86 @@ class NotificationHandler:
         """
         return self.sign_descriptions.get(raw_name, self._format_sign_phrase(raw_name))
 
-    def _get_localized_description(self, raw_name: str, lang: str) -> str:
+    def _play_audio_async(self, audio_path: Path):
         """
-        Return a localized (translated) description for the sign if possible.
-        Falls back to English description if translation library or language unsupported.
+        Play audio asynchronously (non-blocking) using pydub.
         """
-        base_desc = self._get_description(raw_name)
-        if lang.startswith("en"):
-            return base_desc
-        key = (raw_name, lang)
-        if key in self._translation_cache:
-            return self._translation_cache[key]
-        translated = base_desc
-        try:
-            from googletrans import Translator
-            tr = Translator()
-            translated = tr.translate(base_desc, dest=lang).text
-        except Exception as e:
-            logger.debug(f"Translation fallback to English for {raw_name} ({lang}): {e}")
-            translated = base_desc
-        self._translation_cache[key] = translated
-        return translated
-
-    def _resolve_tts_lang(self, requested_lang: str) -> str:
-        """
-        Return a gTTS-supported language code for synthesis.
-        Uses alias map; if still unsupported, default to English.
-        """
-        # Normalize
-        base = requested_lang.lower()
-        # Direct support
-        if base in self.gtts_supported:
-            return base
-        # Alias mapping
-        alias = self.language_alias_map.get(base)
-        if alias and alias in self.gtts_supported:
-            if base not in self._unsupported_warned:
-                logger.warning(f"gTTS does not support '{base}', using '{alias}' voice fallback.")
-                self._unsupported_warned.add(base)
-            return alias
-        # Final fallback
-        if base not in self._unsupported_warned:
-            logger.warning(f"gTTS does not support '{base}', falling back to 'en'.")
-            self._unsupported_warned.add(base)
-        return 'en'
-
-    def _build_tts(self, text: str, lang: str, fallback_lang: str = "en"):
-        """
-        Build gTTS with resolved language alias; fallback to English on failure.
-        """
-        resolved = self._resolve_tts_lang(lang)
-        try:
-            return gTTS(text=text, lang=resolved)
-        except Exception as e:
-            logger.debug(f"gTTS build failed for '{resolved}' ({lang} requested): {e}; fallback to {fallback_lang}")
-            return gTTS(text=text, lang=fallback_lang)
+        if not self.use_pydub:
+            return
+        def _runner():
+            try:
+                seg = AudioSegment.from_file(audio_path)
+                play(seg)
+            except Exception as e:
+                logger.warning(f"Async playback failed for {audio_path.name}: {e}")
+        threading.Thread(target=_runner, daemon=True).start()
 
     def notify_traffic_sign(self, detected_sign: str, languages: Optional[List[str]] = None):
         """
-        Notify user; generate / play audio (translated per selected language).
-        Shows English + selected language players.
+        Use pre-existing audio files only. No TTS generation or translation.
+        Autoplay first language in user selection order (background if possible).
         """
         if languages is None:
             languages = self.available_languages
+
         phrase = self._format_sign_phrase(detected_sign)
-        base_description = self._get_description(detected_sign)
-        logger.info(f"Detected traffic sign: {phrase} -> Multilingual descriptions")
-        self._show_visual_notification(f"{phrase}|||{base_description}")
+        description = self._get_description(detected_sign)
+        logger.info(f"Detected traffic sign: {phrase} (raw='{detected_sign}') using pre-generated audio files.")
+        self._show_visual_notification(f"{phrase}|||{description}")
 
-        # English canonical audio generation (unchanged logic except now uses _build_tts)
-        english_key = (detected_sign, "en")
-        english_audio_path = self.audio_dir / f"{detected_sign}_en.mp3"
-        # Accept externally provided English file (if any) without regenerating
-        if english_audio_path.exists() and english_key not in self._audio_cache:
-            self._audio_cache[english_key] = english_audio_path
-            self._audio_text_cache[english_key] = self._external_marker  # do not force regeneration
-        if english_key not in self._audio_cache or not self._audio_cache[english_key].exists() or (
-            self._audio_text_cache.get(english_key) not in (self._external_marker, base_description)
-        ):
+        found_entries = []
+        preferred_first = None
+
+        # Preserve user-provided order (no reordering)
+        ordered_langs = [lang for lang in languages if lang in self.available_languages]
+
+        for lang in ordered_langs:
+            audio_path = self.audio_dir / f"{detected_sign}_{lang}.mp3"
+            if audio_path.exists():
+                found_entries.append((lang, audio_path))
+                if preferred_first is None:
+                    preferred_first = (lang, audio_path)
+            else:
+                logger.warning(f"Missing audio file: {audio_path}")
+
+        if not found_entries:
+            st.warning(f"No audio files found for {phrase}. Expected pattern: {detected_sign}_<lang>.mp3")
+            return
+
+        # Background autoplay of first selected language if possible
+        first_lang, first_path = preferred_first
+        autoplay_success = False
+        if self.background_autoplay and self.use_pydub:
             try:
-                tts_en = self._build_tts(base_description, "en")
-                tts_en.save(english_audio_path)
-                self._audio_cache[english_key] = english_audio_path
-                self._audio_text_cache[english_key] = base_description
+                self._play_audio_async(first_path)
+                autoplay_success = True
             except Exception as e:
-                logger.error(f"Failed to generate English audio for {detected_sign}: {e}")
+                logger.warning(f"Background autoplay failed, will show player: {e}")
+
+        if not autoplay_success:
+            # Show player for first even if hiding is configured, because autoplay didn’t truly happen
+            try:
+                with open(first_path, "rb") as f:
+                    st.audio(f.read(), format="audio/mp3")
+            except Exception as e:
+                logger.error(f"Autoplay/inline fallback failed for {first_path.name}: {e}")
+
+        # Decide which entries to display as players
+        if autoplay_success and self.hide_autoplay_player:
+            display_entries = found_entries[1:]
         else:
-            english_audio_path = self._audio_cache[english_key]
+            display_entries = found_entries
 
-        first_spoken = False
-        ui_audio_entries = [("English", english_audio_path, base_description, "en")]
-
-        for lang in languages:
+        st.markdown(f"**Audio Files ({self._format_sign_phrase(detected_sign)}):**")
+        cols = st.columns(min(5, len(display_entries))) if display_entries else []
+        for i, (lang, path) in enumerate(display_entries):
             try:
-                localized_desc = self._get_localized_description(detected_sign, lang)
-                desired_text = localized_desc
-                cache_key = (detected_sign, lang)
-                audio_file = self.audio_dir / f"{detected_sign}_{lang}.mp3"
-
-                # NEW: if an external file is present but not cached, register it and skip regeneration
-                if audio_file.exists() and cache_key not in self._audio_cache:
-                    self._audio_cache[cache_key] = audio_file
-                    self._audio_text_cache[cache_key] = self._external_marker
-
-                regenerate = True
-                if cache_key in self._audio_cache and self._audio_cache[cache_key].exists():
-                    # If it was marked external, never overwrite
-                    existing_marker = self._audio_text_cache.get(cache_key)
-                    if existing_marker == self._external_marker or existing_marker == desired_text:
-                        regenerate = False
-
-                if regenerate:
-                    try:
-                        tts = self._build_tts(desired_text, lang)
-                        tts.save(audio_file)
-                        self._audio_cache[cache_key] = audio_file
-                        self._audio_text_cache[cache_key] = desired_text
-                        logger.debug(f"Generated TTS ({lang}) for {detected_sign} using voice '{self._resolve_tts_lang(lang)}'")
-                    except Exception as e:
-                        logger.error(f"TTS generation failed ({detected_sign}, {lang}): {e}")
-                        if not first_spoken:
-                            self._speak_offline(desired_text)
-                            first_spoken = True
-                        continue
-                if lang != "en":
-                    ui_audio_entries.append((lang, audio_file, desired_text, lang))
-                if not first_spoken:
-                    if self.use_pydub:
-                        try:
-                            seg = AudioSegment.from_file(audio_file)
-                            play(seg)
-                            first_spoken = True
-                            continue
-                        except Exception as e:
-                            logger.warning(f"pydub playback failed ({lang}): {e}")
-                    if not self.use_pydub and not self.warned_no_ffmpeg:
-                        st.warning("ffmpeg not found. Using embedded audio fallback.")
-                        self.warned_no_ffmpeg = True
-                    # Avoid repeating embed warning every call
-                    try:
-                        with open(audio_file, "rb") as f:
-                            st.audio(f.read(), format="audio/mp3")
-                        first_spoken = True
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Embedded audio playback failed ({lang}): {e}")
-                    self._speak_offline(desired_text)
-                    first_spoken = True
-            except Exception as e:
-                logger.error(f"Multilingual handling failed for {detected_sign} ({lang}): {e}")
-
-        # Render audio players (unchanged structure)
-        st.markdown(f"**Audio Descriptions ({phrase}):**")
-        cols = st.columns(min(4, len(ui_audio_entries)))
-        for i, (label, path, _text_used, lang_code) in enumerate(ui_audio_entries):
-            try:
-                if path and path.exists():
-                    with open(path, "rb") as f:
-                        with cols[i % len(cols)]:
-                            st.audio(f.read(), format="audio/mp3")
-                            st.caption(f"{label} ({lang_code})")
-                else:
+                with open(path, "rb") as f:
                     with cols[i % len(cols)]:
-                        st.warning(f"Audio missing for {label}")
+                        st.audio(f.read(), format="audio/mp3")
+                        st.caption(lang + (" (auto)" if autoplay_success and lang == first_lang else ""))
             except Exception as e:
-                logger.warning(f"Failed showing audio player for {label}: {e}")
-        # End notify
+                logger.warning(f"Could not load audio player for {path.name}: {e}")
 
     def set_notification_theme(self, **kwargs):
         """
