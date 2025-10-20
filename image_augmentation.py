@@ -13,6 +13,7 @@ from albumentations.pytorch import ToTensorV2
 from typing import List, Tuple, Dict, Optional
 import logging
 from PIL import Image, ImageEnhance, ImageFilter
+import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,12 +37,50 @@ class ImageAugmenter:
         # Initialize augmentation pipelines
         self._setup_augmentation_pipelines()
         
-    def _setup_augmentation_pipelines(self):
-        """Setup different augmentation pipelines for different scenarios"""
+        # Create directory and log file for preprocessing/augmentation records
+        self._init_logging()
         
+    def _init_logging(self):
+        """Create directory and log file for preprocessing/augmentation records."""
+        self.log_dir = self.output_path / "augmentation_logs"
+        self.log_dir.mkdir(exist_ok=True, parents=True)
+        self.log_file = self.log_dir / "preprocessing_log.txt"
+        if not self.log_file.exists():
+            with open(self.log_file, "w", encoding="utf-8") as f:
+                f.write("Preprocessing / Augmentation Log\n")
+                f.write("=" * 60 + "\n")
+                f.write("timestamp\tmode\tclass\tpipeline\toriginal_path\toutput_path\tapplied_transforms\n")
+
+    def _log_preprocess_event(self,
+                              mode: str,
+                              class_name: str,
+                              pipeline_name: str,
+                              original_path: Path,
+                              output_path: Path,
+                              applied_transforms: List[str]):
+        """Append a single preprocessing record line."""
+        ts = datetime.datetime.utcnow().isoformat()
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\t{mode}\t{class_name}\t{pipeline_name}\t"
+                    f"{original_path}\t{output_path}\t{';'.join(applied_transforms)}\n")
+
+    def _extract_applied_transforms(self, replay_dict: dict) -> List[str]:
+        """Extract only transforms that were actually applied from a ReplayCompose replay."""
+        applied = []
+        try:
+            for t in replay_dict.get("transforms", []):
+                if t.get("applied"):
+                    name = t.get("__class_fullname__", t.get("transform", "Unknown"))
+                    # Shorten class path if present
+                    applied.append(name.split(".")[-1])
+        except Exception:
+            pass
+        return applied or ["None"]
+
+    def _setup_augmentation_pipelines(self):
+        """Setup different augmentation pipelines for different scenarios (ReplayCompose enabled)."""
         # Basic augmentation pipeline
-        self.basic_pipeline = A.Compose([
-            A.HorizontalFlip(p=0.5),
+        self.basic_pipeline = A.ReplayCompose([
             A.RandomRotate90(p=0.3),
             A.Rotate(limit=15, p=0.5),
             A.RandomBrightnessContrast(
@@ -60,8 +99,7 @@ class ImageAugmenter:
         ])
         
         # Aggressive augmentation for minority classes
-        self.aggressive_pipeline = A.Compose([
-            A.HorizontalFlip(p=0.7),
+        self.aggressive_pipeline = A.ReplayCompose([
             A.RandomRotate90(p=0.5),
             A.Rotate(limit=30, p=0.7),
             A.RandomBrightnessContrast(
@@ -83,7 +121,7 @@ class ImageAugmenter:
         ])
         
         # Weather and lighting conditions
-        self.weather_pipeline = A.Compose([
+        self.weather_pipeline = A.ReplayCompose([
             A.RandomRain(slant_lower=-10, slant_upper=10, drop_length=20, drop_width=1, p=0.3),
             A.RandomShadow(shadow_roi=(0, 0.5, 1, 1), num_shadows_lower=1, num_shadows_upper=2, p=0.3),
             A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_lower=0, angle_upper=1, p=0.2),
@@ -91,7 +129,7 @@ class ImageAugmenter:
         ])
         
         # Perspective and geometric transformations
-        self.geometric_pipeline = A.Compose([
+        self.geometric_pipeline = A.ReplayCompose([
             A.Perspective(scale=(0.05, 0.1), p=0.5),
             A.ShiftScaleRotate(
                 shift_limit=0.1,
@@ -109,7 +147,7 @@ class ImageAugmenter:
         ])
         
         # Color and lighting variations
-        self.color_pipeline = A.Compose([
+        self.color_pipeline = A.ReplayCompose([
             A.RandomBrightnessContrast(
                 brightness_limit=0.4,
                 contrast_limit=0.4,
@@ -128,7 +166,7 @@ class ImageAugmenter:
         ])
         
         # Noise and quality degradation
-        self.noise_pipeline = A.Compose([
+        self.noise_pipeline = A.ReplayCompose([
             A.GaussNoise(var_limit=(10.0, 100.0), p=0.5),
             A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),
             A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=0.3),
@@ -167,6 +205,14 @@ class ImageAugmenter:
             if img is not None:
                 cv2.imwrite(str(new_path), img)
                 augmented_paths.append(new_path)
+                self._log_preprocess_event(
+                    mode="copy",
+                    class_name=class_name,
+                    pipeline_name="original",
+                    original_path=img_path,
+                    output_path=new_path,
+                    applied_transforms=["None"]
+                )
         
         # Calculate how many augmentations we need
         needed_augmentations = target_count - current_count
@@ -177,10 +223,13 @@ class ImageAugmenter:
         # Select augmentation pipeline
         if augmentation_type == "aggressive":
             pipeline = self.aggressive_pipeline
+            pipeline_name = "aggressive"
         elif augmentation_type == "balanced":
             pipeline = self._get_balanced_pipeline()
+            pipeline_name = "balanced"
         else:
             pipeline = self.basic_pipeline
+            pipeline_name = "basic"
         
         # Generate augmentations
         aug_count = 0
@@ -194,13 +243,22 @@ class ImageAugmenter:
             
             # Apply augmentation
             try:
-                augmented = pipeline(image=img)['image']
-                
-                # Save augmented image
+                result = pipeline(image=img)
+                augmented = result['image']
+                replay = result.get('replay', {})
+                applied = self._extract_applied_transforms(replay)
                 aug_path = class_dir / f"aug_{aug_count:04d}.jpg"
                 cv2.imwrite(str(aug_path), augmented)
                 augmented_paths.append(aug_path)
                 aug_count += 1
+                self._log_preprocess_event(
+                    mode="augment",
+                    class_name=class_name,
+                    pipeline_name=pipeline_name,
+                    original_path=original_img_path,
+                    output_path=aug_path,
+                    applied_transforms=applied
+                )
                 
             except Exception as e:
                 logger.warning(f"Error augmenting image {original_img_path}: {e}")
@@ -211,13 +269,16 @@ class ImageAugmenter:
     
     def _get_balanced_pipeline(self) -> A.Compose:
         """Get a balanced augmentation pipeline that combines multiple techniques"""
-        return A.OneOf([
-            self.basic_pipeline,
-            self.weather_pipeline,
-            self.geometric_pipeline,
-            self.color_pipeline,
-            self.noise_pipeline,
-        ], p=1.0)
+        # Recreate on demand so ReplayCompose replays are independent
+        return A.ReplayCompose([
+            A.OneOf([
+                A.Compose(self.basic_pipeline.transforms),
+                A.Compose(self.weather_pipeline.transforms),
+                A.Compose(self.geometric_pipeline.transforms),
+                A.Compose(self.color_pipeline.transforms),
+                A.Compose(self.noise_pipeline.transforms),
+            ], p=1.0)
+        ])
     
     def create_augmented_dataset(self, class_distribution: Dict, 
                                 target_balance: str = "mean") -> Dict:
@@ -345,15 +406,29 @@ class ImageAugmenter:
         
         for i, (name, pipeline) in enumerate(pipelines[:7]):
             try:
-                augmented = pipeline(image=img)['image']
+                result = pipeline(image=img)
+                augmented = result['image']
+                replay = result.get('replay', {})
+                applied = self._extract_applied_transforms(replay)
                 augmented_rgb = cv2.cvtColor(augmented, cv2.COLOR_BGR2RGB)
                 axes[i+1].imshow(augmented_rgb)
                 axes[i+1].set_title(f"{name} Augmentation")
                 axes[i+1].axis('off')
+                # Log visualization augmentation
+                vis_out = self.aug_dir / f"vis_{class_name}_{name.lower()}_{i}.jpg"
+                cv2.imwrite(str(vis_out), augmented)
+                self._log_preprocess_event(
+                    mode="visualize",
+                    class_name=class_name,
+                    pipeline_name=name.lower(),
+                    original_path=original_img_path,
+                    output_path=vis_out,
+                    applied_transforms=applied
+                )
             except Exception as e:
                 logger.warning(f"Error in {name} augmentation: {e}")
-                axes[i+1].text(0.5, 0.5, f"Error in {name}", 
-                             ha='center', va='center', transform=axes[i+1].transAxes)
+                axes[i+1].text(0.5, 0.5, f"Error in {name}",
+                               ha='center', va='center', transform=axes[i+1].transAxes)
                 axes[i+1].axis('off')
         
         plt.suptitle(f"Augmentation Examples for {class_name}", fontsize=16)

@@ -239,4 +239,103 @@ For issues and questions:
 
 ---
 
-**Note**: This system is designed for educational and research purposes. Always follow local traffic laws and regulations when using in real-world applications. 
+**Note**: This system is designed for educational and research purposes. Always follow local traffic laws and regulations when using in real-world applications.
+
+# Traffic Sign Recognition & Driver Alert System (India)
+
+YOLO-based Indian traffic sign detection with real-time visual and multilingual audio alerts (Streamlit UI).
+
+## 1) Environment
+
+- Python 3.10–3.12
+- Recommended: a GPU with CUDA for faster training (optional)
+
+Install dependencies:
+```
+pip install -U pip
+pip install ultralytics opencv-python albumentations pillow tqdm seaborn matplotlib pyyaml
+pip install streamlit gTTS pydub playsound langcodes
+```
+Optional (for some augmentation warnings):
+```
+pip install scikit-image
+```
+Windows audio backend tip:
+- For pydub autoplay, install ffmpeg and add it to PATH.
+
+## 2) Dataset Layout
+
+Place your dataset under `Dataset/`:
+```
+Dataset/
+  Mandatory_Traffic_Signs/
+    STOP/
+      00001.jpg
+      ...
+  Cautionary_Traffic_Signs/
+  Informatory_Traffic_Signs/
+```
+
+## 3) Quick Start (Train with defaults)
+
+From the repo root:
+```
+python traffic_sign_recognition.py
+```
+This runs training with defaults:
+- Prepares dataset into `output/{train,val,test}/`
+- Trains YOLO (model folder: `output/traffic_sign_model/`)
+- Saves best weights to `output/traffic_sign_model/weights/best.pt` and copies to `output/best_model.pt`
+- Generates visualizations and confusion matrix under `output/visualizations/`
+
+You can customize:
+```
+python traffic_sign_recognition.py --mode train --epochs 50 --batch 16 --imgsz 640 --device auto
+```
+
+## 4) Validate
+
+```
+python traffic_sign_recognition.py --mode validate --model output/traffic_sign_model/weights/best.pt
+```
+Outputs mAP and saves validation confusion matrix to `output/visualizations/`.
+
+## 5) Real-time Detection
+
+Webcam (0) or a video file:
+```
+python traffic_sign_recognition.py --mode detect --model output/best_model.pt --source 0 --conf 0.4
+```
+
+## 6) Export
+
+Export to ONNX (example):
+```
+python traffic_sign_recognition.py --mode export --model output/best_model.pt --format onnx
+```
+
+## 7) Streamlit App (optional)
+
+If you use the Streamlit UI (with audio notifications):
+```
+streamlit run streamlit_app.py
+```
+- Pre-generated audio files should be placed at `output/audio_alerts/<RAW_CLASS>_<lang>.mp3`
+  e.g., `output/audio_alerts/GAP_IN_MEDIAN_en.mp3`, `..._hi.mp3`
+
+## 8) Augmentation
+
+Augmented images and reports are saved in:
+- `output/augmented_data/`
+- `output/augmentation_logs/preprocessing_log.txt` (records transforms applied)
+
+## 9) Outputs and Visualizations
+
+- Training results CSV: `output/traffic_sign_model/results.csv`
+- Visual graphs and confusion matrix: `output/visualizations/`
+- Best model: `output/traffic_sign_model/weights/best.pt` and `output/best_model.pt`
+
+## 10) Common Issues
+
+- ffmpeg not found: install ffmpeg and ensure it is in PATH for audio autoplay.
+- Slow training on CPU: reduce `--imgsz 320` and `--batch 2`, or use a GPU (`--device 0`).

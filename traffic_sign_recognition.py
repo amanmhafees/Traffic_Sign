@@ -11,6 +11,7 @@ import yaml
 import shutil
 import random
 from pathlib import Path
+from metrics_logger import MetricsLogger, generate_plots_from_results
 from ultralytics import YOLO
 import time
 import argparse
@@ -22,6 +23,7 @@ from data_analysis import DataAnalyzer
 from image_augmentation import ImageAugmenter
 from training_visualization import TrainingVisualizer
 from tqdm import tqdm  # Import tqdm for progress bar
+import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -109,12 +111,85 @@ class TrafficSignRecognition:
         
         self.model = None
         self.class_names = []
+        # Lazy-init heavy components (avoid augmentation warnings for plots/val_only/test_only)
+        self.data_analyzer = None
+        self.image_augmenter = None
+        self.training_visualizer = None
         
-        # Initialize analysis and augmentation components
-        self.data_analyzer = DataAnalyzer(str(self.dataset_path), str(self.output_path))
-        self.image_augmenter = ImageAugmenter(str(self.output_path))
-        self.training_visualizer = TrainingVisualizer(str(self.output_path))
-        
+    def _ensure_min_images_per_class(self, min_count: int = 300) -> None:
+        """
+        Top-up each class to have at least `min_count` images (default 300) by running augmentation
+        and copying the generated images back into the class folders inside Dataset/.
+
+        Args:
+            min_count: Minimum number of images required per class
+        """
+        categories = ["Mandatory_Traffic_Signs", "Cautionary_Traffic_Signs", "Informatory_Traffic_Signs"]
+        # Lazy init augmenter
+        if self.image_augmenter is None:
+            self.image_augmenter = ImageAugmenter(str(self.output_path))
+
+        for category in categories:
+            category_path = self.dataset_path / category
+            if not category_path.exists():
+                continue
+            for class_dir in [d for d in category_path.iterdir() if d.is_dir()]:
+                image_files = list(class_dir.glob("*.jpg"))
+                curr = len(image_files)
+                if curr >= min_count:
+                    continue
+
+                if curr == 0:
+                    logger.warning(f"Class '{class_dir.name}' has 0 images. Skipping augmentation.")
+                    continue
+
+                needed = min_count - curr
+                logger.info(f"Class '{class_dir.name}': {curr} images found. Generating {needed} augmented images to reach {min_count}.")
+
+                # Pick augmentation intensity based on deficit
+                deficit_ratio = needed / max(curr, 1)
+                aug_type = "aggressive" if deficit_ratio > 2.0 else "balanced"
+
+                # Ask augmenter to produce at least min_count total
+                try:
+                    augmented_paths = self.image_augmenter.augment_class(
+                        class_name=class_dir.name,
+                        image_paths=image_files,
+                        target_count=min_count,
+                        augmentation_type=aug_type
+                    )
+                except Exception as e:
+                    logger.warning(f"Augmentation failed for class '{class_dir.name}': {e}")
+                    continue
+
+                # Copy augmented images back to Dataset class folder until we hit min_count
+                copied = 0
+                # Round-robin the generated set to fill exactly 'needed'
+                idx = 0
+                while copied < needed and augmented_paths:
+                    src = Path(augmented_paths[idx % len(augmented_paths)])
+                    if not src.exists():
+                        idx += 1
+                        continue
+                    # Generate a unique destination name
+                    dest_name = f"aug_{(curr + copied):05d}.jpg"
+                    dest_path = class_dir / dest_name
+                    # Ensure uniqueness
+                    suffix = 0
+                    while dest_path.exists():
+                        dest_name = f"aug_{(curr + copied):05d}_{suffix}.jpg"
+                        dest_path = class_dir / dest_name
+                        suffix += 1
+                    try:
+                        shutil.copyfile(src, dest_path)
+                        copied += 1
+                    except Exception as ce:
+                        logger.warning(f"Failed copying {src} -> {dest_path}: {ce}")
+                    idx += 1
+
+                final_count = len(list(class_dir.glob("*.jpg")))
+                logger.info(f"Class '{class_dir.name}' now has {final_count} images.")
+
     def prepare_dataset(self, train_split: float = 0.8, val_from_train: bool = True, test_split: float = 0.1) -> None:
         """
         Prepare the dataset for YOLO training by converting to YOLO format
@@ -125,7 +200,9 @@ class TrafficSignRecognition:
             test_split: Fraction of data to use for testing (e.g., 0.1 = 10% test)
         """
         logger.info("Preparing dataset for YOLO training...")
-        
+        # Ensure minimum 300 images per class before splitting
+        self._ensure_min_images_per_class(min_count=300)
+
         # Get all class directories
         class_dirs = []
         for category in ["Mandatory_Traffic_Signs", "Cautionary_Traffic_Signs", "Informatory_Traffic_Signs"]:
@@ -185,6 +262,10 @@ class TrafficSignRecognition:
         """
         logger.info("Starting comprehensive dataset analysis...")
         
+        # Ensure analyzer exists only when needed
+        if self.data_analyzer is None:
+            self.data_analyzer = DataAnalyzer(str(self.dataset_path), str(self.output_path))
+        
         # Run data analysis
         analysis_results = self.data_analyzer.analyze_dataset()
         
@@ -214,6 +295,12 @@ class TrafficSignRecognition:
             Dictionary with balanced dataset information
         """
         logger.info("Starting dataset balancing with augmentation...")
+        
+        # Ensure analyzer and augmenter exist only when needed
+        if self.data_analyzer is None:
+            self.data_analyzer = DataAnalyzer(str(self.dataset_path), str(self.output_path))
+        if self.image_augmenter is None:
+            self.image_augmenter = ImageAugmenter(str(self.output_path))
         
         # First analyze the dataset
         analysis_results = self.analyze_dataset()
@@ -276,6 +363,94 @@ class TrafficSignRecognition:
         
         logger.info(f"Created YAML config at {yaml_path}")
     
+    def _best_model_path(self) -> Path:
+        """Return saved best.pt path."""
+        return self.output_path / "traffic_sign_model" / "weights" / "best.pt"
+
+    def _data_yaml_path(self) -> Path:
+        """Dataset YAML path used for training/val/test."""
+        return self.output_path / "traffic_signs.yaml"
+
+    def _results_csv_path(self) -> Path:
+        """Ultralytics results.csv path."""
+        return self.output_path / "traffic_sign_model" / "results.csv"
+
+    def _get_class_names(self) -> list[str]:
+        """
+        Resolve class names from self.class_names, model.names, or YAML fallback.
+        """
+        names = getattr(self, "class_names", None)
+        if names:
+            return list(names)
+        try:
+            model_names = getattr(self.model, "names", None)
+            if isinstance(model_names, dict):
+                return [model_names[i] for i in sorted(model_names.keys())]
+            if isinstance(model_names, (list, tuple)):
+                return list(model_names)
+        except Exception:
+            pass
+        # YAML fallback (optional)
+        try:
+            import yaml
+            yp = self._data_yaml_path()
+            if yp.exists():
+                with open(yp, "r", encoding="utf-8") as f:
+                    y = yaml.safe_load(f)
+                if isinstance(y.get("names"), (list, tuple)):
+                    return list(y["names"])
+        except Exception:
+            pass
+        return []
+
+    def generate_plots_only(self) -> None:
+        """
+        Create Loss/PR/F1/mAP plots from existing results.csv (no training).
+        """
+        class_names = self._get_class_names()
+        csv_path = self._results_csv_path()
+        ok = generate_plots_from_results(self.output_path, class_names, results_csv=csv_path, prefix="train")
+        if not ok:
+            logger.warning("No plots generated (results.csv missing).")
+        else:
+            logger.info("Plots generated successfully from existing results.csv.")
+
+    def validate_only(self, model_path: Path | str) -> None:
+        """
+        Validate saved model; save confusion matrix and per-class metrics.
+        """
+        mp = Path(model_path)
+        if not mp.exists():
+            logging.getLogger(__name__).warning(f"Model not found: {mp}")
+            return
+        try:
+            self.load_model(str(mp))
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to load model for validation: {e}")
+            return
+        data_yaml = self._data_yaml_path()
+        metrics = self.model.val(data=str(data_yaml) if data_yaml.exists() else None)
+        class_names = self._get_class_names()
+        MetricsLogger.from_ultralytics(self.output_path, class_names, metrics)
+
+    def test_only(self, model_path: Path | str) -> None:
+        """
+        Test on the test split; save confusion matrix and per-class metrics.
+        """
+        mp = Path(model_path)
+        if not mp.exists():
+            logging.getLogger(__name__).warning(f"Model not found: {mp}")
+            return
+        try:
+            self.load_model(str(mp))
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to load model for testing: {e}")
+            return
+        data_yaml = self._data_yaml_path()
+        metrics = self.model.val(split="test", data=str(data_yaml) if data_yaml.exists() else None)
+        class_names = self._get_class_names()
+        MetricsLogger.from_ultralytics(self.output_path, class_names, metrics)
+
     def train_model(self, epochs: int = 100, imgsz: int = 640, batch: int = 16, device: str = "auto", test_split: float = 0.1) -> str:
         """
         Train the YOLO model with optional test dataset evaluation.
@@ -292,8 +467,12 @@ class TrafficSignRecognition:
         """
         logger.info("Starting YOLO model training...")
         
-        # Prepare dataset with test split
-        self.prepare_dataset(train_split=1 - test_split, val_from_train=False)
+        # Prepare dataset with test split (skip if already prepared)
+        yaml_cfg = self.output_path / "traffic_signs.yaml"
+        if not yaml_cfg.exists():
+            self.prepare_dataset(train_split=1 - test_split, val_from_train=False)
+        else:
+            logger.info(f"Dataset already prepared. Using config: {yaml_cfg}")
 
         # Check GPU availability and limit thread usage to reduce RAM pressure
         import torch
@@ -418,15 +597,72 @@ class TrafficSignRecognition:
         self._save_training_summary(results, model_name)
         
         # Generate comprehensive visualizations
-        self._generate_training_visualizations(model_name)
-        
-        # Evaluate on the test dataset
-        logger.info("Evaluating model on the test dataset...")
-        test_metrics = self.model.val(split='test')
-        logger.info(f"Test dataset evaluation completed! mAP50: {test_metrics.box.map50:.3f}, mAP50-95: {test_metrics.box.map:.3f}")
-        
-        return str(best_model_path)
+        try:
+            # class names should already be known on self.class_names or read from model.names
+            class_names = getattr(self, "class_names", None) or list(getattr(self.model, "names", {}).values())
+            self._generate_training_visualizations(class_names)
+        except Exception:
+            pass
+
+        # Evaluate on the test dataset and save confusion matrix/per-class metrics
+        try:
+            data_yaml = self._data_yaml_path()
+            test_metrics = self.model.val(split='test', data=str(data_yaml) if data_yaml.exists() else None)
+            logging.getLogger(__name__).info(f"Test dataset evaluation completed! mAP50: {getattr(test_metrics.box,'map50',float('nan')):.3f}, mAP50-95: {getattr(test_metrics.box,'map',float('nan')):.3f}")
+            MetricsLogger.from_ultralytics(self.output_path, class_names, test_metrics)  # saves confusion matrix + per-class CSV/plots
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Testing failed. Model may not be compatible. {e}")
+
+        return str(self._best_model_path())
     
+    def _save_confusion_matrix(self, metrics, model_name: str, split: str = "test") -> None:
+        """
+        Save confusion matrix (image + CSV) if available in Ultralytics metrics object.
+        """
+        try:
+            cm_obj = getattr(metrics, "confusion_matrix", None)
+            if cm_obj is None:
+                logger.warning("Confusion matrix not found in metrics object.")
+                return
+
+            # Ultralytics confusion matrix often exposes .matrix; fallback to object itself
+            matrix = getattr(cm_obj, "matrix", None)
+            if matrix is None:
+                matrix = np.array(cm_obj)
+
+            if matrix is None or matrix.size == 0:
+                logger.warning("Confusion matrix data empty.")
+                return
+
+            out_dir = self.output_path / "visualizations"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save numeric matrix
+            csv_path = out_dir / f"confusion_matrix_{split}.csv"
+            np.savetxt(csv_path, matrix, delimiter=",", fmt="%.0f")
+            
+            # Plot heatmap
+            fig_size = max(6, len(self.class_names) * 0.4)
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            sns.heatmap(
+                matrix,
+                annot=False,
+                cmap="Blues",
+                xticklabels=self.class_names,
+                yticklabels=self.class_names,
+                cbar_kws={'shrink': 0.6}
+            )
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            ax.set_title(f"Confusion Matrix ({split})")
+            fig.tight_layout()
+            img_path = out_dir / f"confusion_matrix_{split}.png"
+            fig.savefig(img_path, dpi=200)
+            plt.close(fig)
+            logger.info(f"Confusion matrix saved: {img_path} and {csv_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save confusion matrix: {e}")
+
     def _save_training_summary(self, results, model_name: str) -> None:
         """
         Save training results summary
@@ -468,6 +704,8 @@ class TrafficSignRecognition:
         """
         try:
             logger.info("Generating comprehensive training visualizations...")
+            if self.training_visualizer is None:
+                self.training_visualizer = TrainingVisualizer(str(self.output_path))
             
             # Generate training curves and interactive dashboard
             self.training_visualizer.generate_comprehensive_report(model_name)
@@ -502,6 +740,8 @@ class TrafficSignRecognition:
         metrics = self.model.val()
         
         logger.info(f"Validation completed! mAP50: {metrics.box.map50:.3f}, mAP50-95: {metrics.box.map:.3f}")
+        # NEW: validation confusion matrix
+        self._save_confusion_matrix(metrics, model_name="validation_run", split="val")
         return metrics
     
     def load_model(self, model_path: str) -> None:
@@ -693,86 +933,86 @@ class TrafficSignRecognition:
 
 def main():
     """Main function to run the traffic sign recognition system"""
-    parser = argparse.ArgumentParser(description="Traffic Sign Recognition with YOLO v11")
-    parser.add_argument("--mode", choices=["prepare", "analyze", "balance", "train", "validate", "detect", "export"], 
-                       default="train", help="Operation mode")
-    parser.add_argument("--dataset", default="Dataset", help="Dataset path")
-    parser.add_argument("--output", default="output", help="Output path")
-    parser.add_argument("--model", help="Path to trained model")
-    parser.add_argument("--epochs", type=int, default=10, help="Training epochs") #running epoch seting number
-    parser.add_argument("--batch", type=int, default=16, help="Batch size")
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size")
-    parser.add_argument("--device", default="auto", help="Device to use (auto, cpu, 0, 1, etc.)")
-    parser.add_argument("--conf", type=float, default=0.4, help="Confidence threshold")
-    parser.add_argument("--source", default="0", help="Video source for detection")
-    parser.add_argument("--format", default="onnx", help="Export format")
-    parser.add_argument("--balance", choices=["mean", "max", "custom"], default="mean", 
-                       help="Dataset balancing strategy")
-    parser.add_argument("--analyze-only", action="store_true", help="Only run analysis without training")
-    
+    parser = argparse.ArgumentParser(description="Traffic Sign Recognition")
+    parser.add_argument("--mode", choices=["all", "prepare", "train", "validate", "test", "detect", "export", "plots", "val_only", "test_only"], default="all")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--model", type=str, default="")
+    parser.add_argument("--source", type=str, default="0")
+    parser.add_argument("--conf", type=float, default=0.4)
+    parser.add_argument("--test_split", type=float, default=0.1)
     args = parser.parse_args()
+
+    tsr = TrafficSignRecognition()
+    best_path = tsr._best_model_path()
+
+    if args.mode in ("all", "prepare"):
+        # Prepare dataset (train/val/test); skip if already prepared
+        try:
+            tsr.prepare_dataset(train_split=1 - args.test_split, val_from_train=False)
+        except Exception:
+            logger.warning("Dataset preparation failed or already done. Skipping.")
+            pass
+
+    if args.mode in ("all", "train"):
+        # Train; returns path to best weights
+        best_model_path = tsr.train_model(
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=args.device,
+            test_split=args.test_split
+        )
+
+    if args.mode in ("all", "validate"):
+        # Validate using provided model or best from training
+        model_path = args.model or best_model_path
+        if model_path:
+            try:
+                tsr.validate_model(model_path)
+            except Exception:
+                logger.warning("Validation failed. Model may not be compatible.")
+                pass
+
+    if args.mode in ("all", "test"):
+        model_path = args.model or str(tsr._best_model_path())
+        if Path(model_path).exists():
+            try:
+                tsr.load_model(model_path)
+                data_yaml = tsr._data_yaml_path()
+                test_metrics = tsr.model.val(split="test", data=str(data_yaml) if data_yaml.exists() else None)
+                class_names = getattr(tsr, "class_names", None) or list(getattr(tsr.model, "names", {}).values())
+                MetricsLogger.from_ultralytics(tsr.output_path, class_names, test_metrics)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Testing failed. Model may not be compatible. {e}")
+        else:
+            logging.getLogger(__name__).warning(f"Best model not found at {model_path}")
     
-    # Initialize system
-    tsr = TrafficSignRecognition(args.dataset, args.output)
+    if args.mode == "detect":
+        if not args.model:
+            raise ValueError("Model path required for detection")
+        tsr.load_model(args.model)
+        tsr.run_realtime_detection(args.source, args.conf)
+        
+    if args.mode == "export":
+        if not args.model:
+            raise ValueError("Model path required for export")
+        exported_path = tsr.export_model(args.model, args.format)
+        print(f"Model exported to: {exported_path}")
     
-    try:
-        if args.mode == "prepare":
-            tsr.prepare_dataset(val_from_train=True)
-            
-        elif args.mode == "analyze":
-            print("Running comprehensive dataset analysis...")
-            analysis_results = tsr.analyze_dataset()
-            print(f"Analysis completed! Results saved to {tsr.output_path / 'analysis'}")
-            
-        elif args.mode == "balance":
-            print("Balancing dataset with augmentation...")
-            balanced_dataset = tsr.balance_dataset(args.balance)
-            print(f"Dataset balancing completed! Augmented data saved to {tsr.output_path / 'augmented_data'}")
-            
-        elif args.mode == "train":
-            # Run analysis first if requested
-            if args.analyze_only:
-                print("Running dataset analysis...")
-                tsr.analyze_dataset()
-                print("Analysis completed!")
-                return
-            
-            # Prepare dataset
-            tsr.prepare_dataset(val_from_train=True)
-            
-            # Optionally balance dataset
-            if args.balance != "none":
-                print(f"Balancing dataset using {args.balance} strategy...")
-                tsr.balance_dataset(args.balance)
-            
-            # Train model
-            model_path = tsr.train_model(args.epochs, args.imgsz, args.batch, args.device)
-            print(f"Training completed! Model saved at: {model_path}")
-            print(f"Best model also available at: {tsr.output_path / 'best_model.pt'}")
-            print(f"Visualizations saved to: {tsr.output_path / 'visualizations'}")
-            
-        elif args.mode == "validate":
-            if not args.model:
-                raise ValueError("Model path required for validation")
-            tsr.load_model(args.model)
-            metrics = tsr.validate_model(args.model)
-            print(f"Validation metrics: {metrics}")
-            
-        elif args.mode == "detect":
-            if not args.model:
-                raise ValueError("Model path required for detection")
-            tsr.load_model(args.model)
-            tsr.run_realtime_detection(args.source, args.conf)
-            
-        elif args.mode == "export":
-            if not args.model:
-                raise ValueError("Model path required for export")
-            exported_path = tsr.export_model(args.model, args.format)
-            print(f"Model exported to: {exported_path}")
-            
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        raise
+    if args.mode == "plots":
+        tsr.generate_plots_only()
+        return
+
+    if args.mode == "val_only":
+        tsr.validate_only(args.model or best_path)
+        return
+
+    if args.mode == "test_only":
+        tsr.test_only(args.model or best_path)
+        return
 
 if __name__ == "__main__":
     main()
