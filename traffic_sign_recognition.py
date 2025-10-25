@@ -115,6 +115,8 @@ class TrafficSignRecognition:
         self.data_analyzer = None
         self.image_augmenter = None
         self.training_visualizer = None
+        # NEW: runtime device holder
+        self.runtime_device: str = "cpu"
         
     def _ensure_min_images_per_class(self, min_count: int = 300) -> None:
         """
@@ -429,7 +431,8 @@ class TrafficSignRecognition:
             logging.getLogger(__name__).warning(f"Failed to load model for validation: {e}")
             return
         data_yaml = self._data_yaml_path()
-        metrics = self.model.val(data=str(data_yaml) if data_yaml.exists() else None)
+        metrics = self.model.val(data=str(data_yaml) if data_yaml.exists() else None,
+                                 device=self.runtime_device)
         class_names = self._get_class_names()
         MetricsLogger.from_ultralytics(self.output_path, class_names, metrics)
 
@@ -447,7 +450,9 @@ class TrafficSignRecognition:
             logging.getLogger(__name__).warning(f"Failed to load model for testing: {e}")
             return
         data_yaml = self._data_yaml_path()
-        metrics = self.model.val(split="test", data=str(data_yaml) if data_yaml.exists() else None)
+        metrics = self.model.val(split="test",
+                                 data=str(data_yaml) if data_yaml.exists() else None,
+                                 device=self.runtime_device)
         class_names = self._get_class_names()
         MetricsLogger.from_ultralytics(self.output_path, class_names, metrics)
 
@@ -474,6 +479,9 @@ class TrafficSignRecognition:
         else:
             logger.info(f"Dataset already prepared. Using config: {yaml_cfg}")
 
+        # Resolve device once
+        dev = self.configure_device(device)
+        
         # Check GPU availability and limit thread usage to reduce RAM pressure
         import torch
         try:
@@ -486,14 +494,13 @@ class TrafficSignRecognition:
             pass
         if torch.cuda.is_available():
             logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
-            if device == "auto":
-                device = "0"  # Use first GPU
+            dev = "0"  # Use first GPU
         else:
             logger.warning("No GPU detected, using CPU")
-            device = "cpu"
+            dev = "cpu"
         
         # Load YOLO model
-        self.model = YOLO("yolo11s.pt")  # Using YOLO11s for faster training
+        self.model = YOLO("yolo11s.pt")
         
         # Clear possible corrupted label cache files to avoid EOFError
         try:
@@ -522,8 +529,8 @@ class TrafficSignRecognition:
                 epochs=epochs,
                 imgsz=imgsz,
                 batch=batch,
-                device=device,
-                workers=4 if device != "cpu" else 0,
+                device=dev,  # ensure GPU is used if available
+                workers=4 if dev != "cpu" else 0,
                 augment=True,
                 patience=20,
                 save=True,
@@ -531,9 +538,9 @@ class TrafficSignRecognition:
                 project=str(self.output_path),
                 name=model_name,
                 cache=False,
-                amp=True if device != "cpu" else False,
+                amp=True if dev != "cpu" else False,
                 val=True,
-                plots=False,  # disable heavy plotting to reduce RAM
+                plots=False,
                 verbose=True,
             )
         except RuntimeError as e:
@@ -607,7 +614,9 @@ class TrafficSignRecognition:
         # Evaluate on the test dataset and save confusion matrix/per-class metrics
         try:
             data_yaml = self._data_yaml_path()
-            test_metrics = self.model.val(split='test', data=str(data_yaml) if data_yaml.exists() else None)
+            test_metrics = self.model.val(split='test',
+                                          data=str(data_yaml) if data_yaml.exists() else None,
+                                          device=dev)
             logging.getLogger(__name__).info(f"Test dataset evaluation completed! mAP50: {getattr(test_metrics.box,'map50',float('nan')):.3f}, mAP50-95: {getattr(test_metrics.box,'map',float('nan')):.3f}")
             MetricsLogger.from_ultralytics(self.output_path, class_names, test_metrics)  # saves confusion matrix + per-class CSV/plots
         except Exception as e:
@@ -737,13 +746,61 @@ class TrafficSignRecognition:
             self.model = YOLO(model_path)
         
         # Run validation
-        metrics = self.model.val()
+        metrics = self.model.val(device=self.runtime_device)
         
         logger.info(f"Validation completed! mAP50: {metrics.box.map50:.3f}, mAP50-95: {metrics.box.map:.3f}")
         # NEW: validation confusion matrix
         self._save_confusion_matrix(metrics, model_name="validation_run", split="val")
         return metrics
     
+    def configure_device(self, device_arg: str = "auto") -> str:
+        """
+        Resolve and store device to use with Ultralytics calls.
+        Returns an Ultralytics-compatible device string: "cpu" or GPU index like "0".
+        """
+        try:
+            import torch
+            cuda_ok = torch.cuda.is_available()
+            gpu_count = torch.cuda.device_count() if cuda_ok else 0
+            if device_arg == "auto":
+                if cuda_ok and gpu_count > 0:
+                    self.runtime_device = "0"  # first CUDA device
+                else:
+                    self.runtime_device = "cpu"
+            else:
+                # Normalize various inputs: "cuda", "cuda:0", "0", "cpu"
+                s = str(device_arg).strip().lower()
+                if s in ("cpu",):
+                    self.runtime_device = "cpu"
+                elif s.startswith("cuda"):
+                    # cuda or cuda:idx -> use idx if any else 0
+                    if ":" in s:
+                        idx = s.split(":")[1]
+                        self.runtime_device = idx if idx.isdigit() else "0"
+                    else:
+                        self.runtime_device = "0"
+                elif s.isdigit():
+                    self.runtime_device = s
+                else:
+                    self.runtime_device = "cpu"
+
+            # Log environment
+            logger.info("CUDA available: %s | GPUs: %s | selected device: %s",
+                        cuda_ok, (gpu_count if cuda_ok else 0), self.runtime_device)
+            try:
+                logger.info("torch.cuda.version: %s | torch version: %s | cuDNN: %s",
+                            getattr(torch.version, "cuda", None),
+                            torch.__version__,
+                            getattr(torch.backends.cudnn, "enabled", None))
+                if cuda_ok and gpu_count > 0:
+                    logger.info("GPU[0]: %s", torch.cuda.get_device_name(0))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Device configuration failed, defaulting to CPU: {e}")
+            self.runtime_device = "cpu"
+        return self.runtime_device
+
     def load_model(self, model_path: str) -> None:
         """
         Load a trained model
@@ -757,7 +814,8 @@ class TrafficSignRecognition:
         
         logger.info(f"Loading model from {model_path}")
         self.model = YOLO(str(model_path))
-    
+        logger.info(f"Model loaded. Using device: {self.runtime_device}")
+
     def process_frame(self, frame: np.ndarray, conf_threshold: float = 0.5) -> List[Tuple]:
         """
         Process a single frame for traffic sign detection
@@ -776,7 +834,8 @@ class TrafficSignRecognition:
         processed_frame = self._preprocess_frame(frame)
         
         # Run inference
-        results = self.model.predict(processed_frame, conf=conf_threshold, verbose=False)
+        results = self.model.predict(processed_frame, conf=conf_threshold, verbose=False,
+                                     device=self.runtime_device)
         
         alerts = []
         for res in results:
@@ -792,7 +851,9 @@ class TrafficSignRecognition:
         
         # Sort by priority and size
         alerts.sort(key=lambda x: (self.class_priority_map.get(x[0], 0), x[3]), reverse=True)
-        
+
+        # NEW: keep only top-3 detections
+        alerts = alerts[:3]
         return alerts
     
     def _preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -931,6 +992,19 @@ class TrafficSignRecognition:
         logger.info(f"Model exported to: {exported_path}")
         return exported_path
 
+    def notify_top_priority(self, detections: List[Tuple], notifier, languages: Optional[List[str]] = None) -> None:
+        """
+        Play audio only for the highest-priority detection among the provided list.
+        Expects detections as returned by process_frame (already sorted).
+        """
+        try:
+            if not detections:
+                return
+            top_cls_name = detections[0][0]  # highest priority after sorting
+            notifier.notify_traffic_sign(top_cls_name, languages)
+        except Exception as e:
+            logger.warning(f"Failed to notify top-priority sign: {e}")
+
 def main():
     """Main function to run the traffic sign recognition system"""
     parser = argparse.ArgumentParser(description="Traffic Sign Recognition")
@@ -946,6 +1020,8 @@ def main():
     args = parser.parse_args()
 
     tsr = TrafficSignRecognition()
+    # Configure device once from CLI
+    tsr.configure_device(args.device)
     best_path = tsr._best_model_path()
 
     if args.mode in ("all", "prepare"):
@@ -982,7 +1058,9 @@ def main():
             try:
                 tsr.load_model(model_path)
                 data_yaml = tsr._data_yaml_path()
-                test_metrics = tsr.model.val(split="test", data=str(data_yaml) if data_yaml.exists() else None)
+                test_metrics = tsr.model.val(split="test",
+                                             data=str(data_yaml) if data_yaml.exists() else None,
+                                             device=tsr.runtime_device)
                 class_names = getattr(tsr, "class_names", None) or list(getattr(tsr.model, "names", {}).values())
                 MetricsLogger.from_ultralytics(tsr.output_path, class_names, test_metrics)
             except Exception as e:

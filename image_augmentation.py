@@ -14,6 +14,7 @@ from typing import List, Tuple, Dict, Optional
 import logging
 from PIL import Image, ImageEnhance, ImageFilter
 import datetime
+from tqdm import tqdm  # NEW: progress bars
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -78,9 +79,9 @@ class ImageAugmenter:
         return applied or ["None"]
 
     def _setup_augmentation_pipelines(self):
-        """Setup different augmentation pipelines for different scenarios (ReplayCompose enabled)."""
+        """Setup different augmentation pipelines for different scenarios"""
         # Basic augmentation pipeline
-        self.basic_pipeline = A.ReplayCompose([
+        self.basic_pipeline = A.Compose([
             A.RandomRotate90(p=0.3),
             A.Rotate(limit=15, p=0.5),
             A.RandomBrightnessContrast(
@@ -94,12 +95,13 @@ class ImageAugmenter:
                 val_shift_limit=20,
                 p=0.5
             ),
-            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            # Removed invalid var_limit kwarg to match current Albumentations API
+            A.GaussNoise(p=0.3),
             A.Blur(blur_limit=3, p=0.3),
         ])
-        
+
         # Aggressive augmentation for minority classes
-        self.aggressive_pipeline = A.ReplayCompose([
+        self.aggressive_pipeline = A.Compose([
             A.RandomRotate90(p=0.5),
             A.Rotate(limit=30, p=0.7),
             A.RandomBrightnessContrast(
@@ -113,30 +115,27 @@ class ImageAugmenter:
                 val_shift_limit=30,
                 p=0.7
             ),
-            A.GaussNoise(var_limit=(10.0, 80.0), p=0.5),
+            # Removed invalid var_limit kwarg
+            A.GaussNoise(p=0.5),
             A.Blur(blur_limit=5, p=0.5),
             A.MotionBlur(blur_limit=5, p=0.3),
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
-            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.3),
+            # Drop alpha_affine (deprecated); use defaults
+            A.ElasticTransform(p=0.3),
         ])
-        
-        # Weather and lighting conditions
-        self.weather_pipeline = A.ReplayCompose([
-            A.RandomRain(slant_lower=-10, slant_upper=10, drop_length=20, drop_width=1, p=0.3),
-            A.RandomShadow(shadow_roi=(0, 0.5, 1, 1), num_shadows_lower=1, num_shadows_upper=2, p=0.3),
-            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_lower=0, angle_upper=1, p=0.2),
-            A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, alpha_coef=0.1, p=0.2),
+
+        # Weather and lighting conditions (drop deprecated/invalid args; keep behavior via defaults)
+        self.weather_pipeline = A.Compose([
+            A.RandomRain(p=0.3),
+            A.RandomShadow(p=0.3),
+            A.RandomSunFlare(p=0.2),
+            A.RandomFog(p=0.2),
         ])
-        
+
         # Perspective and geometric transformations
-        self.geometric_pipeline = A.ReplayCompose([
+        self.geometric_pipeline = A.Compose([
             A.Perspective(scale=(0.05, 0.1), p=0.5),
-            A.ShiftScaleRotate(
-                shift_limit=0.1,
-                scale_limit=0.2,
-                rotate_limit=15,
-                p=0.5
-            ),
+            # Replace ShiftScaleRotate with Affine as recommended
             A.Affine(
                 scale=(0.8, 1.2),
                 translate_percent=0.1,
@@ -144,10 +143,18 @@ class ImageAugmenter:
                 shear=(-5, 5),
                 p=0.5
             ),
+            # Keep an additional mild Affine to diversify geometry
+            A.Affine(
+                scale=(0.9, 1.1),
+                translate_percent=0.05,
+                rotate=(-10, 10),
+                shear=(-3, 3),
+                p=0.5
+            ),
         ])
-        
+
         # Color and lighting variations
-        self.color_pipeline = A.ReplayCompose([
+        self.color_pipeline = A.Compose([
             A.RandomBrightnessContrast(
                 brightness_limit=0.4,
                 contrast_limit=0.4,
@@ -164,10 +171,11 @@ class ImageAugmenter:
             A.ToGray(p=0.2),
             A.ChannelShuffle(p=0.2),
         ])
-        
+
         # Noise and quality degradation
-        self.noise_pipeline = A.ReplayCompose([
-            A.GaussNoise(var_limit=(10.0, 100.0), p=0.5),
+        self.noise_pipeline = A.Compose([
+            # Removed invalid var_limit kwarg
+            A.GaussNoise(p=0.5),
             A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),
             A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=0.3),
             A.Blur(blur_limit=7, p=0.4),
@@ -198,21 +206,23 @@ class ImageAugmenter:
         augmented_paths = []
         current_count = len(image_paths)
         
-        # Copy original images
-        for i, img_path in enumerate(image_paths):
-            new_path = class_dir / f"original_{i:04d}.jpg"
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                cv2.imwrite(str(new_path), img)
-                augmented_paths.append(new_path)
-                self._log_preprocess_event(
-                    mode="copy",
-                    class_name=class_name,
-                    pipeline_name="original",
-                    original_path=img_path,
-                    output_path=new_path,
-                    applied_transforms=["None"]
-                )
+        # Copy original images with progress
+        with tqdm(total=len(image_paths), desc=f"[{class_name}] copying originals", leave=False) as pbar_copy:
+            for i, img_path in enumerate(image_paths):
+                new_path = class_dir / f"original_{i:04d}.jpg"
+                img = cv2.imread(str(img_path))
+                if img is not None:
+                    cv2.imwrite(str(new_path), img)
+                    augmented_paths.append(new_path)
+                    self._log_preprocess_event(
+                        mode="copy",
+                        class_name=class_name,
+                        pipeline_name="original",
+                        original_path=img_path,
+                        output_path=new_path,
+                        applied_transforms=["None"]
+                    )
+                pbar_copy.update(1)
         
         # Calculate how many augmentations we need
         needed_augmentations = target_count - current_count
@@ -231,39 +241,40 @@ class ImageAugmenter:
             pipeline = self.basic_pipeline
             pipeline_name = "basic"
         
-        # Generate augmentations
+        # Generate augmentations with progress
         aug_count = 0
-        while aug_count < needed_augmentations:
-            # Randomly select an original image
-            original_img_path = random.choice(image_paths)
-            img = cv2.imread(str(original_img_path))
-            
-            if img is None:
-                continue
-            
-            # Apply augmentation
-            try:
-                result = pipeline(image=img)
-                augmented = result['image']
-                replay = result.get('replay', {})
-                applied = self._extract_applied_transforms(replay)
-                aug_path = class_dir / f"aug_{aug_count:04d}.jpg"
-                cv2.imwrite(str(aug_path), augmented)
-                augmented_paths.append(aug_path)
-                aug_count += 1
-                self._log_preprocess_event(
-                    mode="augment",
-                    class_name=class_name,
-                    pipeline_name=pipeline_name,
-                    original_path=original_img_path,
-                    output_path=aug_path,
-                    applied_transforms=applied
-                )
+        with tqdm(total=needed_augmentations, desc=f"[{class_name}] augmenting ({pipeline_name})", leave=False) as pbar_aug:
+            while aug_count < needed_augmentations:
+                # Randomly select an original image
+                original_img_path = random.choice(image_paths)
+                img = cv2.imread(str(original_img_path))
                 
-            except Exception as e:
-                logger.warning(f"Error augmenting image {original_img_path}: {e}")
-                continue
-        
+                if img is None:
+                    continue
+                
+                # Apply augmentation
+                try:
+                    result = pipeline(image=img)
+                    augmented = result['image']
+                    replay = result.get('replay', {})
+                    applied = self._extract_applied_transforms(replay)
+                    aug_path = class_dir / f"aug_{aug_count:04d}.jpg"
+                    cv2.imwrite(str(aug_path), augmented)
+                    augmented_paths.append(aug_path)
+                    aug_count += 1
+                    pbar_aug.update(1)  # update on successful generation
+                    self._log_preprocess_event(
+                        mode="augment",
+                        class_name=class_name,
+                        pipeline_name=pipeline_name,
+                        original_path=original_img_path,
+                        output_path=aug_path,
+                        applied_transforms=applied
+                    )
+                except Exception as e:
+                    logger.warning(f"Error augmenting image {original_img_path}: {e}")
+                    continue
+
         logger.info(f"Generated {aug_count} augmented images for class {class_name}")
         return augmented_paths
     
@@ -308,39 +319,39 @@ class ImageAugmenter:
         
         augmented_dataset = {}
         
-        for class_name, class_data in class_distribution.items():
-            current_count = class_data['count']
-            image_paths = class_data['images']
-            
-            if current_count < target_count:
-                # Determine augmentation strategy based on deficit
-                deficit_ratio = (target_count - current_count) / current_count
+        # Wrap per-class processing with progress
+        classes = list(class_distribution.items())
+        with tqdm(total=len(classes), desc="Balancing classes", leave=True) as pbar_classes:
+            for class_name, class_data in classes:
+                current_count = class_data['count']
+                image_paths = class_data['images']
                 
-                if deficit_ratio > 2.0:  # Need more than 2x augmentation
-                    aug_type = "aggressive"
+                if current_count < target_count:
+                    # Determine augmentation strategy based on deficit
+                    deficit_ratio = (target_count - current_count) / max(current_count, 1)
+                    if deficit_ratio > 2.0:
+                        aug_type = "aggressive"
+                    else:
+                        aug_type = "balanced"
+                    # Augment the class
+                    augmented_paths = self.augment_class(
+                        class_name, image_paths, target_count, aug_type
+                    )
+                    augmented_dataset[class_name] = {
+                        'original_count': current_count,
+                        'augmented_count': len(augmented_paths),
+                        'augmentation_type': aug_type,
+                        'paths': augmented_paths
+                    }
                 else:
-                    aug_type = "balanced"
-                
-                # Augment the class
-                augmented_paths = self.augment_class(
-                    class_name, image_paths, target_count, aug_type
-                )
-                
-                augmented_dataset[class_name] = {
-                    'original_count': current_count,
-                    'augmented_count': len(augmented_paths),
-                    'augmentation_type': aug_type,
-                    'paths': augmented_paths
-                }
-            else:
-                # Class already has enough samples
-                augmented_dataset[class_name] = {
-                    'original_count': current_count,
-                    'augmented_count': current_count,
-                    'augmentation_type': 'none',
-                    'paths': image_paths
-                }
-        
+                    augmented_dataset[class_name] = {
+                        'original_count': current_count,
+                        'augmented_count': current_count,
+                        'augmentation_type': 'none',
+                        'paths': image_paths
+                    }
+                pbar_classes.update(1)
+
         # Save augmentation report
         self._save_augmentation_report(augmented_dataset, target_count)
         
