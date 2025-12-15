@@ -85,6 +85,7 @@ class DataAnalyzer:
         
         # Analyze each class
         total_images = 0
+        total_classes = 0
         class_data = {}
         
         for class_dir in class_dirs:
@@ -104,6 +105,30 @@ class DataAnalyzer:
         # Store results
         self.class_distribution = class_data
         
+        # NEW: compute & log total images and total classes
+        try:
+            # compute from existing structures if available, otherwise recompute
+            if 'class_counts' in locals():
+                total_images = sum(class_counts.values())
+                total_classes = len(class_counts)
+            else:
+                # fall back: count jpg files under dataset categories
+                total_images = 0
+                total_classes = 0
+                for category in ["Mandatory_Traffic_Signs", "Cautionary_Traffic_Signs", "Informatory_Traffic_Signs"]:
+                    cat_path = Path(self.dataset_path) / category
+                    if not cat_path.exists():
+                        continue
+                    for cls in cat_path.iterdir():
+                        if cls.is_dir():
+                            total_classes += 1
+                            total_images += len(list(cls.glob("*.jpg")))
+            logger.info(f"Dataset totals — images: {total_images}, classes: {total_classes}")
+        except Exception as e:
+            logger.warning(f"Could not compute dataset totals: {e}")
+            total_images = total_images if 'total_images' in locals() else 0
+            total_classes = total_classes if 'total_classes' in locals() else 0
+
         # Generate analysis plots
         self._plot_class_distribution()
         self._plot_class_imbalance()
@@ -112,6 +137,10 @@ class DataAnalyzer:
         
         # Generate summary report
         summary = self._generate_summary_report(total_images, class_data)
+        
+        # Ensure the returned summary includes these fields
+        summary.setdefault('total_images', total_images)
+        summary.setdefault('total_classes', total_classes)
         
         logger.info("Dataset analysis completed!")
         return summary
