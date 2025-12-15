@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "D:\Traffic-Sign\Traffic_Sign\debug_repair.py", line 32, in test_repair
+    new_paths = augmenter.augment_class(class_name, images, 300, "balanced")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Traffic-Sign\Traffic_Sign\image_augmentation.py", line 266, in augment_class
+    current_pipeline = pipeline
+                       ^^^^^^^^
+UnboundLocalError: cannot access local variable 'pipeline' where it is not associated with a value

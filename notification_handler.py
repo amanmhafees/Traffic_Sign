@@ -280,7 +280,7 @@ class NotificationHandler:
         logger.info("No suitable backend for background autoplay (ffmpeg & playsound missing).")
         return False
 
-    def notify_traffic_sign(self, detected_sign: str, languages: Optional[List[str]] = None):
+    def notify_traffic_sign(self, detected_sign: str, languages: Optional[List[str]] = None, visual_alert: bool = True, audio_alert: bool = True):
         """
         Use pre-existing audio files only. No TTS generation or translation.
         Autoplay first language in user selection order (background if possible).
@@ -291,7 +291,12 @@ class NotificationHandler:
         phrase = self._format_sign_phrase(detected_sign)
         description = self._get_description(detected_sign)
         logger.info(f"Detected traffic sign: {phrase} (raw='{detected_sign}') using pre-generated audio files.")
-        self._show_visual_notification(f"{phrase}|||{description}")
+        
+        if visual_alert:
+            self._show_visual_notification(f"{phrase}|||{description}")
+
+        if not audio_alert:
+            return
 
         found_entries = []
         preferred_first = None
@@ -333,19 +338,21 @@ class NotificationHandler:
         else:
             display_entries = found_entries
 
-        st.markdown(f"**Audio Files ({self._format_sign_phrase(detected_sign)}):**")
-        cols = st.columns(min(5, len(display_entries))) if display_entries else []
-        for i, (lang, path) in enumerate(display_entries):
-            try:
-                with open(path, "rb") as f:
-                    with cols[i % len(cols)]:
-                        st.audio(f.read(), format="audio/mp3")
-                        tag = ""
-                        if autoplay_success and lang == first_lang:
-                            tag = " (auto)"
-                        st.caption(lang + tag)
-            except Exception as e:
-                logger.warning(f"Could not load audio player for {path.name}: {e}")
+        # Only show the "Audio Files" headers if we have entries to show
+        if display_entries:
+            st.markdown(f"**Audio Files ({self._format_sign_phrase(detected_sign)}):**")
+            cols = st.columns(min(5, len(display_entries))) if display_entries else []
+            for i, (lang, path) in enumerate(display_entries):
+                try:
+                    with open(path, "rb") as f:
+                        with cols[i % len(cols)]:
+                            st.audio(f.read(), format="audio/mp3")
+                            tag = ""
+                            if autoplay_success and lang == first_lang:
+                                tag = " (auto)"
+                            st.caption(lang + tag)
+                except Exception as e:
+                    logger.warning(f"Could not load audio player for {path.name}: {e}")
 
     def set_notification_theme(self, **kwargs):
         """

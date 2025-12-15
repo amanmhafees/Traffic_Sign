@@ -43,6 +43,9 @@ selected_languages = st.sidebar.multiselect(
     default=["en", "hi"],  # Default to English and Hindi
     format_func=lambda lang: Language.get(lang).display_name()  # Convert language code to full name
 )
+# Notification toggles
+enable_audio = st.sidebar.checkbox("Enable Audio Alerts", value=True)
+enable_visual = st.sidebar.checkbox("Enable Visual Alerts", value=True)
 
 # Session state for preventing repeat audio per sign
 if "last_upload_hash" not in st.session_state:
@@ -64,24 +67,22 @@ def load_tsr(model_path):
     tsr.load_model(model_path)
     return tsr
 
-# Image upload
+# Image/Video upload
 uploaded_file = st.file_uploader(
-    "Choose an image...", type=["jpg", "jpeg", "png"]
+    "Choose an image or video...", type=["jpg", "jpeg", "png", "mp4", "avi", "mov"]
 )
 
 if uploaded_file is not None:
+    # Determine file type
+    file_type = uploaded_file.type.split('/')[0]
+    
     # Compute hash of current upload
     file_bytes = uploaded_file.getvalue()
     current_hash = hashlib.sha256(file_bytes).hexdigest()
     if st.session_state["last_upload_hash"] != current_hash:
-        # New image => reset suppression so alerts/audio re-trigger
+        # New upload => reset
         st.session_state["announced_signs"].clear()
         st.session_state["last_upload_hash"] = current_hash
-
-    # Read image
-    image = Image.open(uploaded_file).convert("RGB")
-    img_np = np.array(image)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
     # Load model
     try:
@@ -90,44 +91,119 @@ if uploaded_file is not None:
         st.error(f"Error loading model: {e}")
         st.stop()
 
-    # Run detection
-    with st.spinner("Detecting traffic signs..."):
-        detections = tsr.process_frame(img_bgr, conf_threshold=conf_threshold)
-        result_img = tsr.draw_detections(img_bgr, detections)
-        result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+    if file_type == "image":
+        # Read image
+        image = Image.open(uploaded_file).convert("RGB")
+        img_np = np.array(image)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # Show results
-    st.subheader("Detection Results")
-    def resize_for_display(img_rgb, max_h: int):
-        # Preserve aspect ratio; only downscale if taller than max_h
-        h, w = img_rgb.shape[:2]
-        if h <= max_h:
-            return img_rgb
-        scale = max_h / h
-        new_w = int(w * scale)
-        import cv2 as _cv2
-        return _cv2.resize(img_rgb, (new_w, max_h), interpolation=_cv2.INTER_AREA)
-    display_img = resize_for_display(result_img_rgb, max_display_height)
-    st.image(display_img, caption="Detected Traffic Signs")
+        # Run detection
+        with st.spinner("Detecting traffic signs..."):
+            detections = tsr.process_frame(img_bgr, conf_threshold=conf_threshold)
+            result_img = tsr.draw_detections(img_bgr, detections)
+            result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
 
-    # Show detection details and play audio alerts
-    if detections:
-        st.markdown("**Detected Signs:**")
-        for i, (cls_name, conf_score, bbox, area) in enumerate(detections):
-            x1, y1, x2, y2 = bbox
-            st.write(f"{i+1}. **{cls_name}** (Confidence: {conf_score:.2f}) [Box: ({x1},{y1})-({x2},{y2})]")
-            # Always notify on each image upload (suppression only within the same single image if desired)
-            # Option A: allow repeats for same sign inside same image -> just call notify directly:
-            notification_handler.notify_traffic_sign(cls_name, selected_languages)
+        # Show results (Compact Image View)
+        st.subheader("Detection Results")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+             st.image(image, caption="Uploaded Image", use_container_width=True)
+        with col2:
+             st.image(result_img_rgb, caption="Detected Signs", use_container_width=True)
 
-            # Option B (keep single notification per sign per image):
-            # if cls_name not in st.session_state["announced_signs"]:
-            #     notification_handler.notify_traffic_sign(cls_name, selected_languages)
-            #     st.session_state["announced_signs"].add(cls_name)
-    else:
-        st.info("No traffic signs detected with the current confidence threshold.")
+        # Show detection details and play audio alerts
+        if detections:
+            st.markdown("**Detected Signs:**")
+            for i, (cls_name, conf_score, bbox, area) in enumerate(detections):
+                x1, y1, x2, y2 = bbox
+                st.write(f"{i+1}. **{cls_name}** (Confidence: {conf_score:.2f}) [Box: ({x1},{y1})-({x2},{y2})]")
+                notification_handler.notify_traffic_sign(
+                    cls_name, 
+                    selected_languages, 
+                    visual_alert=enable_visual, 
+                    audio_alert=enable_audio
+                )
+        else:
+            st.info("No traffic signs detected with the current confidence threshold.")
+            
+    elif file_type == "video" or uploaded_file.name.lower().endswith(('.mp4', '.avi', '.mov')):
+        # Save temp input file
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_file.read())
+        tfile.close()
+
+        cap = cv2.VideoCapture(tfile.name)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        st.info(f"Processing Video: {total_frames} frames @ {fps} fps ({width}x{height})")
+        
+        # Output temp file
+        outfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        out_path = outfile.name
+        outfile.close()
+        
+        # Use mp4v codec for temp storage
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Detection
+            detections = tsr.process_frame(frame, conf_threshold=conf_threshold)
+            result_frame = tsr.draw_detections(frame, detections)
+            
+            # Write
+            out.write(result_frame)
+            
+            # Update progress
+            frame_idx += 1
+            if total_frames > 0:
+                progress_bar.progress(min(frame_idx / total_frames, 1.0))
+            
+            # Optional: Real-time visual/audio alerts (throttled) might be too heavy here.
+            # We skip audio/visual alerts per-frame to avoid UI flooding.
+            
+        cap.release()
+        out.release()
+        status_text.text("Processing Complete!")
+        
+        # Re-encode for browser compatibility (using ffmpeg if available, otherwise raw mp4)
+        # Browsers often struggle with raw OpenCV mp4v. 
+        # For now, we display side-by-side.
+        
+        st.subheader("Video Results (Compact View)")
+        vcol1, vcol2 = st.columns(2)
+        
+        with vcol1:
+            st.caption("Original Video")
+            st.video(tfile.name)
+            
+        with vcol2:
+            st.caption("Processed Video (with Detections)")
+            # Note: If codec issues occur, we might need to convert. 
+            # Trying to read back the manually written file.
+            if os.path.exists(out_path):
+                 st.video(out_path)
+            else:
+                 st.error("Error creating output video.")
+
+        # Cleanup
+        os.unlink(tfile.name)
+        # os.unlink(out_path) # Keep output for viewing for now (stream cleanup handles eventually)
+
 else:
-    st.info("Please upload an image to begin.")
+    st.info("Please upload an image or video to begin.")
 
 st.markdown("---")
 st.caption("Built with Streamlit · Powered by YOLO v11 · Indian Traffic Sign Recognition")
