@@ -63,6 +63,31 @@ class TrafficSignRecognition:
         
         # Mapping from Original Class ID (string/int in .txt) -> New Continuous Index
         self.id_mapping = {} 
+
+    def _newest_mtime(self, root: Path) -> float:
+        newest = 0.0
+        try:
+            for p in root.rglob("*.jpg"):
+                try:
+                    newest = max(newest, p.stat().st_mtime)
+                except Exception:
+                    pass
+            for p in root.rglob("*.txt"):
+                try:
+                    newest = max(newest, p.stat().st_mtime)
+                except Exception:
+                    pass
+        except Exception:
+            return newest
+        return newest
+
+    def _output_is_stale(self) -> bool:
+        """Return True if Dataset has newer files than prepared output splits."""
+        if not (self.output_path / "train").exists():
+            return True
+        ds_mtime = self._newest_mtime(self.dataset_path)
+        out_mtime = self._newest_mtime(self.output_path)
+        return ds_mtime > out_mtime
         
     def _ensure_min_images_per_class(self, min_count: int = 300) -> None:
         """
@@ -318,16 +343,16 @@ class TrafficSignRecognition:
         
         # Check if we need to prep dataset
         yaml_cfg = self.output_path / "traffic_signs.yaml"
-        if not yaml_cfg.exists():
-            # Ensure we have a validation split. 
-            # If test_split is 0.1, and we want some val, let's say train=0.8, val=0.1, test=0.1
+        if not yaml_cfg.exists() or self._output_is_stale():
+            logger.info("Preparing dataset (missing or stale output detected)...")
+            # Ensure we have a validation split.
             self.prepare_dataset(train_split=0.8, val_from_train=False, test_split=test_split)
         else:
-            # If exists, we still need to load class names for later usage
+            # If exists and not stale, we still need to load class names for later usage
             with open(yaml_cfg, 'r') as f:
                 data = yaml.safe_load(f)
                 self.class_names = data.get('names', [])
-            logger.info("Dataset verified.")
+            logger.info("Dataset verified and up-to-date.")
 
         dev = self.configure_device(device)
         from ultralytics import YOLO

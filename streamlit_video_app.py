@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from ultralytics import YOLO
 import PIL.Image
+from notification_handler import NotificationHandler
 
 # Configuration
 MODEL_PATH = "output/traffic_sign_model/weights/best.pt"
@@ -25,19 +26,46 @@ st.markdown("""
         background-color: #0E1117;
         color: #FAFAFA;
     }
+    /* Compact primary button */
     .stButton>button {
-        width: 100%;
+        width: auto;
+        min-width: 180px;
         background-color: #FF4B4B;
         color: white;
         border: none;
-        padding: 0.5rem 1rem;
-        border-radius: 0.5rem;
+        padding: 0.4rem 0.9rem;
+        border-radius: 8px;
         font-weight: 600;
-        transition: all 0.3s ease;
+        transition: all 0.2s ease;
+        margin: 8px auto 12px auto;
+        display: block;
     }
     .stButton>button:hover {
-        background-color: #FF0000;
-        box-shadow: 0 4px 12px rgba(255, 75, 75, 0.4);
+        background-color: #ff3131;
+        box-shadow: 0 6px 16px -6px rgba(255, 75, 75, 0.5);
+    }
+    /* Tighten container padding to reduce scrolling */
+    .block-container {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        max-width: 1400px;
+    }
+    /* Video container rounded and compact */
+    .element-container:has(video), .element-container:has(img) {
+        margin-top: 6px;
+        margin-bottom: 6px;
+        border-radius: 12px;
+        overflow: hidden;
+    }
+    /* Cap media to viewport height for visibility */
+    video, img {
+        max-height: 65vh;
+        height: auto;
+        object-fit: contain;
+    }
+    /* Sidebar spacing */
+    [data-testid="stSidebar"] .block-container {
+        padding-top: 12px;
     }
     .metric-card {
         background-color: #262730;
@@ -46,6 +74,9 @@ st.markdown("""
         border: 1px solid #41424C;
         text-align: center;
     }
+    /* Compact metrics */
+    .metric-card b { display:block; margin-bottom: 4px; }
+    .metric-card { padding: 0.75rem; }
     h1, h2, h3 {
         font-family: 'Inter', sans-serif;
     }
@@ -67,7 +98,20 @@ def load_model():
             return None
     return st.session_state['model']
 
-def process_video(video_path, model, conf_threshold, iou_threshold):
+def banner(message: str, container, side: str = "left"):
+    """Render a compact visual banner in the given container."""
+    color = "#2a5298" if side == "left" else "#8a2a2a"
+    container.markdown(
+        f"""
+        <div style="background:{color};color:#fff;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.2);
+                    font-family:system-ui;box-shadow:0 6px 18px -6px rgba(0,0,0,0.55);">
+            {message}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def process_video(video_path, model, conf_threshold, iou_threshold, languages, play_audio=True):
     """
     Process video frame by frame and display results.
     """
@@ -79,13 +123,23 @@ def process_video(video_path, model, conf_threshold, iou_threshold):
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    st_frame = st.empty()
-    st_metrix = st.empty()
+    # Layout: left alerts, center video, right stats (single side banner, fixed metrics)
+    col_left, col_center, col_right = st.columns([1.0, 2.6, 1.0])
+    st_frame = col_center.empty()
+    alert_left = col_left.empty()
+    metrics_container = col_right.container()
+    m1 = metrics_container.empty()
+    m2 = metrics_container.empty()
+    m3 = metrics_container.empty()
+
+    notifier = NotificationHandler(output_path="output")
     progress_bar = st.progress(0)
     
     # Statistics
     frame_count = 0
     detections_log = {} # Class -> Count
+    last_alert_ts = {}  # Class -> last timestamp for debounce
+    cooldown_s = 6.0
     
     stop_button = st.button("Stop Processing")
     
@@ -112,6 +166,14 @@ def process_video(video_path, model, conf_threshold, iou_threshold):
             cls_name = model.names[cls_id]
             detections_log[cls_name] = detections_log.get(cls_name, 0) + 1
 
+            # Debounced audio + visual alerts
+            now = time.time()
+            if now - last_alert_ts.get(cls_name, 0) > cooldown_s:
+                # Visual toast + side banners
+                notifier.notify_traffic_sign(cls_name, languages=languages, visual_alert=True, audio_alert=play_audio)
+                banner(f"🚦 {cls_name.replace('_',' ').title()} detected", alert_left, side="left")
+                last_alert_ts[cls_name] = now
+
         # Display
         frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
         st_frame.image(frame_rgb, channels="RGB", use_container_width=True)
@@ -121,14 +183,10 @@ def process_video(video_path, model, conf_threshold, iou_threshold):
         progress = frame_count / total_frames if total_frames > 0 else 0
         progress_bar.progress(min(progress, 1.0))
         
-        with st_metrix.container():
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"<div class='metric-card'><b>FPS</b><br>{1000/inference_time:.1f}</div>", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"<div class='metric-card'><b>Detections</b><br>{sum(detections_log.values())}</div>", unsafe_allow_html=True)
-            with c3:
-                st.markdown(f"<div class='metric-card'><b>Unique Signs</b><br>{len(detections_log)}</div>", unsafe_allow_html=True)
+        # Fixed metrics (update same placeholders, no stacking)
+        m1.markdown(f"<div class='metric-card'><b>FPS</b><br>{1000/inference_time:.1f}</div>", unsafe_allow_html=True)
+        m2.markdown(f"<div class='metric-card'><b>Detections</b><br>{sum(detections_log.values())}</div>", unsafe_allow_html=True)
+        m3.markdown(f"<div class='metric-card'><b>Unique Signs</b><br>{len(detections_log)}</div>", unsafe_allow_html=True)
 
     cap.release()
     st.success("Video processing completed!")
@@ -145,6 +203,12 @@ def main():
         st.header("Settings")
         conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
         iou_threshold = st.slider("IoU Threshold", 0.0, 1.0, 0.45, 0.05)
+        play_audio = st.toggle("Play Audio Alerts", value=True)
+        languages = st.multiselect(
+            "Audio Languages (order matters; first tries autoplay)",
+            options=["en","hi","ta","te","kn","ml","mr","gu","bn","pa"],
+            default=["en","hi"],
+        )
         
         st.divider()
         st.info("System optimized for Indian Traffic Signs.")
@@ -162,7 +226,7 @@ def main():
         if st.button("Start Detection", type="primary"):
             model = load_model()
             if model:
-                process_video(video_path, model, conf_threshold, iou_threshold)
+                process_video(video_path, model, conf_threshold, iou_threshold, languages, play_audio)
 
 if __name__ == "__main__":
     main()
