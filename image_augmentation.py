@@ -80,73 +80,39 @@ class ImageAugmenter:
         return applied or ["None"]
 
     def _setup_augmentation_pipelines(self):
-        """Setup different augmentation pipelines for different scenarios with BBox support"""
+        """Setup SAFE augmentation pipeline (strict) with YOLO bbox support"""
         import albumentations as A
         
-        # Common Bbox params: YOLO format, ensure labels are passed
-        bbox_params = A.BboxParams(
-            format='yolo', 
-            label_fields=['class_labels'], 
-            min_visibility=0.1, 
-            min_area=10.0
+        # Strict bbox params: keep boxes even if slightly altered; we'll validate manually
+        self.bbox_params = A.BboxParams(
+            format='yolo',
+            label_fields=['class_labels'],
+            min_visibility=0.0,
+            min_area=0.0
         )
 
-        # Basic augmentation pipeline
-        self.basic_pipeline = A.Compose([
-            A.RandomRotate90(p=0.3),
-            A.Rotate(limit=15, p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
-            A.GaussNoise(p=0.3),
-            A.Blur(blur_limit=3, p=0.3),
-        ], bbox_params=bbox_params)
+        # SAFE pipeline per rules: ±5° rotation, mild brightness/contrast, light noise/blur
+        self.safe_pipeline = A.Compose([
+            A.Rotate(limit=5, p=0.3, border_mode=cv2.BORDER_CONSTANT),
+            A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.4),
+            A.GaussNoise(p=0.2),
+            A.Blur(blur_limit=3, p=0.2),
+        ], bbox_params=self.bbox_params)
 
-        # Aggressive augmentation for minority classes
-        self.aggressive_pipeline = A.Compose([
-            A.RandomRotate90(p=0.5),
-            A.Rotate(limit=30, p=0.7),
-            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
-            A.HueSaturationValue(hue_shift_limit=30, sat_shift_limit=40, val_shift_limit=30, p=0.7),
-            A.GaussNoise(p=0.5),
-            A.Blur(blur_limit=5, p=0.5),
-            A.MotionBlur(blur_limit=5, p=0.3),
-            # GripDistortion/ElasticTransform can be risky for small bboxes, but keeping with conservative limits
-            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),
-        ], bbox_params=bbox_params)
-
-        # Weather and lighting conditions
-        self.weather_pipeline = A.Compose([
-            A.RandomRain(p=0.3),
-            A.RandomShadow(p=0.3),
-            A.RandomSunFlare(p=0.2),
-            A.RandomFog(p=0.2),
-        ], bbox_params=bbox_params)
-
-        # Perspective and geometric transformations
-        self.geometric_pipeline = A.Compose([
-            A.Perspective(scale=(0.05, 0.1), p=0.5),
-            A.Affine(scale=(0.8, 1.2), translate_percent=0.1, rotate=(-15, 15), shear=(-5, 5), p=0.5),
-        ], bbox_params=bbox_params)
-
-        # Color and lighting variations
-        self.color_pipeline = A.Compose([
-            A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.8),
-            A.HueSaturationValue(hue_shift_limit=40, sat_shift_limit=50, val_shift_limit=40, p=0.8),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.5),
-            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
-            A.ToGray(p=0.2),
-            A.ChannelShuffle(p=0.2),
-        ], bbox_params=bbox_params)
-
-        # Noise and quality degradation
-        self.noise_pipeline = A.Compose([
-            A.GaussNoise(p=0.5),
-            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),
-            A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=0.3),
-            A.Blur(blur_limit=7, p=0.4),
-            A.MotionBlur(blur_limit=7, p=0.3),
-            A.MedianBlur(blur_limit=5, p=0.2),
-        ], bbox_params=bbox_params)
+    def _bboxes_valid(self, bboxes: List[List[float]]) -> bool:
+        """Validate YOLO bboxes: >=5% size and fully within image bounds."""
+        if not bboxes:
+            return False
+        for (xc, yc, w, h) in [b[:4] for b in bboxes]:
+            # size threshold
+            if w < 0.05 or h < 0.05:
+                return False
+            # fully inside image (normalized coords)
+            if (xc - w / 2) < 0.0 or (xc + w / 2) > 1.0:
+                return False
+            if (yc - h / 2) < 0.0 or (yc + h / 2) > 1.0:
+                return False
+        return True
     
     def _read_bboxes(self, img_path: Path) -> List[List[float]]:
         """
@@ -170,12 +136,16 @@ class ImageAugmenter:
         return bboxes
 
     def augment_class(self, class_name: str, image_paths: List[Path], 
-                     target_count: int, augmentation_type: str = "balanced") -> List[Path]:
+                      target_count: Optional[int] = None) -> List[Path]:
         """
-        Augment images for a specific class to reach target count
-        HANDLES BOUNDING BOXES (YOLO FORMAT)
+        Augment images for a specific class using SAFE transforms.
+        Limits augmentation to at most 1.5x the original class size.
+        Preserves YOLO bbox integrity and rejects invalid augmentations.
         """
-        logger.info(f"Augmenting class {class_name} from {len(image_paths)} to {target_count} images")
+        orig_size = len(image_paths)
+        max_allowed = int(orig_size * 1.5)
+        target_count = max_allowed if (target_count is None or target_count > max_allowed) else target_count
+        logger.info(f"Augmenting class {class_name}: original={orig_size}, target<= {target_count} (max 1.5x)")
         
         # Create class directory
         class_dir = self.aug_dir / class_name
@@ -231,16 +201,8 @@ class ImageAugmenter:
         if needed_augmentations <= 0:
             return augmented_paths
         
-        # Select augmentation pipeline
-        if augmentation_type == "aggressive":
-            pipeline = self.aggressive_pipeline
-            pipeline_name = "aggressive"
-        elif augmentation_type == "balanced":
-            # For simplicity in 'balanced', just pick random sub-pipelines
-            pipeline_name = "balanced"
-        else:
-            pipeline = self.basic_pipeline
-            pipeline_name = "basic"
+        pipeline = self.safe_pipeline
+        pipeline_name = "safe"
         
         # Generate augmentations
         aug_count = 0
@@ -248,7 +210,7 @@ class ImageAugmenter:
             logger.warning(f"No valid original data for {class_name}, cannot augment.")
             return augmented_paths
 
-        print(f"[{class_name}] Augmenting {needed_augmentations} images...")
+        print(f"[{class_name}] Augmenting {needed_augmentations} images (SAFE)...")
         pbar = tqdm(total=needed_augmentations, desc=f"Augmenting {class_name}", unit="aug")
         while aug_count < needed_augmentations:
                 # Randomly select sample
@@ -263,16 +225,7 @@ class ImageAugmenter:
                 yolo_bboxes = [b[:4] for b in bboxes_with_cls]
                 class_labels = [b[4] for b in bboxes_with_cls]
                 
-                # Choose pipeline (if balanced, rotate through some)
-                if pipeline_name == "balanced":
-                    current_pipeline = random.choice([
-                        self.basic_pipeline, 
-                        self.weather_pipeline, 
-                        self.geometric_pipeline, 
-                        self.color_pipeline
-                    ])
-                else:
-                    current_pipeline = pipeline
+                current_pipeline = pipeline
 
                 try:
                     # AUGMENT
@@ -283,6 +236,13 @@ class ImageAugmenter:
                     aug_img = result['image']
                     aug_bboxes = result['bboxes']
                     aug_labels = result['class_labels']
+
+                    # Integrity checks: same count, valid boxes
+                    if len(aug_bboxes) != len(yolo_bboxes) or len(aug_bboxes) != len(aug_labels):
+                        continue
+                    # Validate bbox sizes and bounds (normalized)
+                    if not self._bboxes_valid([[*b, aug_labels[i]] for i, b in enumerate(aug_bboxes)]):
+                        continue
                     
                     # Save
                     aug_img_name = f"aug_{aug_count:04d}.jpg"
@@ -298,9 +258,8 @@ class ImageAugmenter:
                             
                     augmented_paths.append(aug_img_path)
                     
-                    # Log
-                    replay = result.get('replay', {})
-                    applied = self._extract_applied_transforms(replay)
+                    # Log (static list of safe transforms)
+                    applied = ["Rotate(±5)", "RandomBrightnessContrast(≤10%)", "GaussNoise(light)", "Blur(≤3)"]
                     self._log_preprocess_event(
                         mode="augment",
                         class_name=class_name,

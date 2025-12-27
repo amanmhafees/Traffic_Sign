@@ -89,76 +89,76 @@ class TrafficSignRecognition:
         out_mtime = self._newest_mtime(self.output_path)
         return ds_mtime > out_mtime
         
-    def _ensure_min_images_per_class(self, min_count: int = 300) -> None:
+    def _augment_per_class_dynamic(self) -> None:
         """
-        Top-up each class to have at least `min_count` images using augmentation.
-        Updates Dataset folder with new images AND corresponding .txt labels.
+        Dynamic, per-class augmentation strategy (safe, realistic):
+        - Keep all classes; do NOT force equal counts.
+        - If 1–2 real images: cap total to real + 2 (very mild aug).
+        - If 3–9 real images: cap total ≤ 1.3× real count.
+        - If ≥10 real images: cap total ≤ 1.5× real count.
+        Uses ImageAugmenter.safe pipeline and copies augmented images + labels back
+        into source class folders to maintain downstream processing.
         """
-        categories = ["Mandatory_Traffic_Signs", "Cautionary_Traffic_Signs"] # Removed Informatory
-        # Lazy init augmenter
+        categories = ["Mandatory_Traffic_Signs", "Cautionary_Traffic_Signs"]
         if self.image_augmenter is None:
-            print("DEBUG: Importing ImageAugmenter...", flush=True)
             from image_augmentation import ImageAugmenter
-            print("DEBUG: ImageAugmenter imported. Initializing...", flush=True)
             self.image_augmenter = ImageAugmenter(str(self.output_path))
+
+        def compute_cap(n: int) -> int:
+            if n <= 2:
+                return n + 2
+            if 3 <= n <= 9:
+                return int(np.floor(n * 1.3))
+            return int(np.floor(n * 1.5))
 
         for category in categories:
             category_path = self.dataset_path / category
             if not category_path.exists():
                 logger.warning(f"Category not found: {category}")
                 continue
-                
+
             for class_dir in [d for d in category_path.iterdir() if d.is_dir()]:
-                # Find all images
                 image_files = list(class_dir.glob("*.jpg"))
                 curr = len(image_files)
-                if curr >= min_count:
-                    continue
-
                 if curr == 0:
                     logger.warning(f"Class '{class_dir.name}' has 0 images. Skipping augmentation.")
                     continue
 
-                needed = min_count - curr
-                logger.info(f"Class '{class_dir.name}': {curr} images. Augmenting to {min_count}.")
+                cap = compute_cap(curr)
+                if cap <= curr:
+                    logger.info(f"Class '{class_dir.name}': {curr} images (no augmentation needed, cap={cap}).")
+                    continue
 
-                # Determine intensity
-                deficit_ratio = needed / max(curr, 1)
-                aug_type = "aggressive" if deficit_ratio > 2.0 else "balanced"
+                needed = cap - curr
+                logger.info(f"Class '{class_dir.name}': {curr} images. Augmenting +{needed} to cap={cap}.")
 
-                # Run augmentation (Now returns list of Path to augmented images)
-                # The Augmenter creates files in output/augmented_data/ClassName/...
                 try:
                     augmented_paths = self.image_augmenter.augment_class(
                         class_name=class_dir.name,
                         image_paths=image_files,
-                        target_count=min_count,
-                        augmentation_type=aug_type
+                        target_count=cap
                     )
                 except Exception as e:
                     logger.warning(f"Augmentation failed for class '{class_dir.name}': {e}")
                     continue
 
-                # Copy augmented files (images AND txts) back to Source Dataset
-                # to sustain the pipeline
+                # Copy only the required number of augmented samples back to source Dataset
                 copied = 0
                 idx = 0
                 while copied < needed and augmented_paths:
                     src_img = Path(augmented_paths[idx % len(augmented_paths)])
                     src_txt = src_img.with_suffix('.txt')
-                    
+
                     if not src_img.exists():
                         idx += 1
                         continue
-                        
-                    # Destination names
+
                     dest_img_name = f"aug_{(curr + copied):05d}.jpg"
                     dest_txt_name = f"aug_{(curr + copied):05d}.txt"
-                    
+
                     dest_img_path = class_dir / dest_img_name
                     dest_txt_path = class_dir / dest_txt_name
-                    
-                    # Ensure uniqueness
+
                     suffix_count = 0
                     while dest_img_path.exists():
                         dest_img_name = f"aug_{(curr + copied):05d}_{suffix_count}.jpg"
@@ -166,10 +166,9 @@ class TrafficSignRecognition:
                         dest_img_path = class_dir / dest_img_name
                         dest_txt_path = class_dir / dest_txt_name
                         suffix_count += 1
-                        
+
                     try:
                         shutil.copyfile(src_img, dest_img_path)
-                        # Copy associated label if it exists
                         if src_txt.exists():
                             shutil.copyfile(src_txt, dest_txt_path)
                         copied += 1
@@ -178,7 +177,7 @@ class TrafficSignRecognition:
                     idx += 1
 
                 final_count = len(list(class_dir.glob("*.jpg")))
-                logger.info(f"Class '{class_dir.name}' now has {final_count} images.")
+                logger.info(f"Class '{class_dir.name}' now has {final_count} images (cap {cap}).")
 
     def _build_class_index(self, class_dirs: List[Path]) -> None:
         """
@@ -235,8 +234,8 @@ class TrafficSignRecognition:
         """
         logger.info("Preparing dataset for YOLO training...")
         
-        # 1. Augment
-        self._ensure_min_images_per_class(min_count=300)
+        # 1. Augment using dynamic, safe per-class caps
+        self._augment_per_class_dynamic()
 
         # 2. Collect Valid Directories
         class_dirs = []
@@ -335,7 +334,7 @@ class TrafficSignRecognition:
         with open(yaml_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False)
 
-    def train_model(self, epochs: int = 100, imgsz: int = 640, batch: int = 16, device: str = "auto", test_split: float = 0.1, workers: int = 2) -> str:
+    def train_model(self, epochs: int = 100, imgsz: int = 960, batch: int = 16, device: str = "auto", test_split: float = 0.1, workers: int = 2) -> str:
         """
         Train the YOLO model 
         """
@@ -371,7 +370,21 @@ class TrafficSignRecognition:
                 name=model_name,
                 exist_ok=True, # Allow overwrite existing project/name
                 plots=True,
-                workers=workers
+                workers=workers,
+                # SAFE training-time augmentation settings
+                hsv_h=0.0,
+                hsv_s=0.0,
+                hsv_v=0.0,
+                mosaic=0.0,
+                mixup=0.0,
+                perspective=0.0,
+                degrees=5.0,
+                shear=0.0,
+                translate=0.05,
+                scale=0.0,
+                fliplr=0.0,
+                flipud=0.0,
+                erasing=0.0
             )
             
             # Print Training Results
@@ -380,16 +393,90 @@ class TrafficSignRecognition:
                 print(f"Validation mAP50: {results.box.map50:.4f}")
                 print(f"Validation mAP50-95: {results.box.map:.4f}")
             
-            # Evaluate on Test Split
+            # Evaluate on Val and Test splits and persist metrics
+            logger.info("Evaluating on Validation split...")
+            val_metrics = self.model.val(split='val', device=dev)
+
             logger.info("Evaluating on Test Split...")
             test_metrics = self.model.val(split='test', device=dev)
+
+            # Console summary
+            print("-" * 30)
+            print("VALIDATION RESULTS:")
+            print(f"Precision: {getattr(val_metrics.box, 'mp', float('nan')):.4f}")
+            print(f"Recall:    {getattr(val_metrics.box, 'mr', float('nan')):.4f}")
+            print(f"mAP50:     {getattr(val_metrics.box, 'map50', float('nan')):.4f}")
+            print(f"mAP50-95:  {getattr(val_metrics.box, 'map', float('nan')):.4f}")
             print("-" * 30)
             print("TEST SET RESULTS:")
-            print(f"Precision: {test_metrics.box.mp:.4f}")
-            print(f"Recall:    {test_metrics.box.mr:.4f}")
-            print(f"mAP50:     {test_metrics.box.map50:.4f}")
-            print(f"mAP50-95:  {test_metrics.box.map:.4f}")
+            print(f"Precision: {getattr(test_metrics.box, 'mp', float('nan')):.4f}")
+            print(f"Recall:    {getattr(test_metrics.box, 'mr', float('nan')):.4f}")
+            print(f"mAP50:     {getattr(test_metrics.box, 'map50', float('nan')):.4f}")
+            print(f"mAP50-95:  {getattr(test_metrics.box, 'map', float('nan')):.4f}")
             print("-" * 30)
+
+            # Save summary TXT
+            try:
+                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                metrics_dir = self.output_path / "traffic_sign_model"
+                metrics_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = metrics_dir / "metrics_summary.txt"
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Timestamp: {ts}\n")
+                    f.write(f"Classes: {len(self.class_names)}\n")
+                    f.write("\nTRAIN (final validation during training):\n")
+                    if hasattr(results, 'box'):
+                        f.write(f"Val mAP@0.5: {getattr(results.box, 'map50', float('nan')):.4f}\n")
+                        f.write(f"Val mAP@0.5:0.95: {getattr(results.box, 'map', float('nan')):.4f}\n")
+
+                    f.write("\nVAL (evaluated post-train):\n")
+                    v_mp = float(getattr(val_metrics.box, 'mp', float('nan')))
+                    v_mr = float(getattr(val_metrics.box, 'mr', float('nan')))
+                    v_f1 = (2*v_mp*v_mr/(v_mp+v_mr)) if (v_mp+v_mr) > 0 and np.isfinite(v_mp) and np.isfinite(v_mr) else float('nan')
+                    # Accuracy from confusion matrix if available
+                    v_cm = getattr(getattr(val_metrics, 'confusion_matrix', None), 'matrix', None)
+                    v_acc = float('nan')
+                    if v_cm is not None:
+                        v_cm_arr = np.array(v_cm, dtype=float)
+                        total = v_cm_arr.sum()
+                        v_acc = (np.trace(v_cm_arr)/total) if total > 0 else float('nan')
+                    f.write(f"Precision: {v_mp:.4f}\n")
+                    f.write(f"Recall:    {v_mr:.4f}\n")
+                    f.write(f"F1:        {v_f1:.4f}\n")
+                    f.write(f"Accuracy:  {v_acc:.4f}\n")
+                    f.write(f"mAP@0.5:   {float(getattr(val_metrics.box, 'map50', float('nan'))):.4f}\n")
+                    f.write(f"mAP@0.5:95:{float(getattr(val_metrics.box, 'map', float('nan'))):.4f}\n")
+
+                    f.write("\nTEST:\n")
+                    t_mp = float(getattr(test_metrics.box, 'mp', float('nan')))
+                    t_mr = float(getattr(test_metrics.box, 'mr', float('nan')))
+                    t_f1 = (2*t_mp*t_mr/(t_mp+t_mr)) if (t_mp+t_mr) > 0 and np.isfinite(t_mp) and np.isfinite(t_mr) else float('nan')
+                    t_cm = getattr(getattr(test_metrics, 'confusion_matrix', None), 'matrix', None)
+                    t_acc = float('nan')
+                    if t_cm is not None:
+                        t_cm_arr = np.array(t_cm, dtype=float)
+                        total = t_cm_arr.sum()
+                        t_acc = (np.trace(t_cm_arr)/total) if total > 0 else float('nan')
+                    f.write(f"Precision: {t_mp:.4f}\n")
+                    f.write(f"Recall:    {t_mr:.4f}\n")
+                    f.write(f"F1:        {t_f1:.4f}\n")
+                    f.write(f"Accuracy:  {t_acc:.4f}\n")
+                    f.write(f"mAP@0.5:   {float(getattr(test_metrics.box, 'map50', float('nan'))):.4f}\n")
+                    f.write(f"mAP@0.5:95:{float(getattr(test_metrics.box, 'map', float('nan'))):.4f}\n")
+
+                logger.info(f"Saved metrics summary to {summary_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write metrics summary: {e}")
+
+            # Save per-class metrics and confusion matrices to visualizations
+            try:
+                # Validation
+                _ = MetricsLogger.from_ultralytics(self.output_path, self.class_names, val_metrics, prefix="val")
+                # Test
+                _ = MetricsLogger.from_ultralytics(self.output_path, self.class_names, test_metrics, prefix="test")
+                logger.info(f"Saved per-class metrics and confusion matrices under {(self.output_path / 'visualizations').resolve()}")
+            except Exception as e:
+                logger.warning(f"Failed saving per-class metrics: {e}")
             
         except Exception as e:
             logger.error(f"Training failed: {e}")
@@ -407,7 +494,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Traffic Sign Recognition Training")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size")
+    parser.add_argument("--imgsz", type=int, default=960, help="Image size")
     parser.add_argument("--device", type=str, default="auto", help="Device (cpu, cuda, 0, etc)")
     parser.add_argument("--workers", type=int, default=2, help="Number of data loading workers")
     

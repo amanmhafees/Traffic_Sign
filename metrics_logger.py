@@ -252,6 +252,7 @@ class MetricsLogger:
 		out_root: Union[str, Path],
 		class_names: List[str],
 		metrics_obj,
+		prefix: str = "val",
 	) -> "MetricsLogger":
 		"""
 		Convenience: build confusion matrix and per-class arrays from a Ultralytics metrics object.
@@ -263,7 +264,7 @@ class MetricsLogger:
 		try:
 			cm = getattr(getattr(metrics_obj, "confusion_matrix", None), "matrix", None)
 			if cm is not None:
-				logger.save_confusion_matrix(np.array(cm), normalize=False, prefix="val")
+				logger.save_confusion_matrix(np.array(cm), normalize=False, prefix=prefix)
 		except Exception:
 			pass
 
@@ -286,7 +287,7 @@ class MetricsLogger:
 					"map50": float(map50[i]) if i < len(map50) else np.nan,
 					"map50_95": float(map50_95[i]) if i < len(map50_95) else np.nan,
 				}
-			logger.save_per_class_metrics(per_class, prefix="val")
+			logger.save_per_class_metrics(per_class, prefix=prefix)
 		except Exception:
 			pass
 
