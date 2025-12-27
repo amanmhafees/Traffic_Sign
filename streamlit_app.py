@@ -4,7 +4,7 @@ import cv2
 from PIL import Image
 import tempfile
 import os
-from traffic_sign_recognition import TrafficSignRecognition
+from two_stage_recognizer import TwoStageSignRecognizer
 import time
 import hashlib
 
@@ -27,7 +27,7 @@ model_path = st.sidebar.text_input(
     value="output/traffic_sign_model/weights/best.pt"
 )
 conf_threshold = st.sidebar.slider(
-    "Confidence threshold", min_value=0.1, max_value=1.0, value=0.4, step=0.05
+    "Confidence threshold", min_value=0.1, max_value=1.0, value=0.5, step=0.01
 )
 max_display_height = st.sidebar.number_input(
     "Max display image height (px)",
@@ -61,11 +61,18 @@ for k in list(st.session_state.keys()):
             del st.session_state[k]
 
 # Load model (cache for performance)
+CNN_WEIGHTS = "output/cnn_classifier.pt"
+CNN_CLASSES = "output/cnn_classes.json"
+CLASSIFIER_THRESHOLD = 0.75
+
 @st.cache_resource(show_spinner=True)
-def load_tsr(model_path):
-    tsr = TrafficSignRecognition()
-    tsr.load_model(model_path)
-    return tsr
+def load_two_stage(model_path):
+    return TwoStageSignRecognizer(
+        yolo_weights=model_path,
+        cnn_weights=CNN_WEIGHTS,
+        classes_path=CNN_CLASSES,
+        classifier_threshold=CLASSIFIER_THRESHOLD,
+    )
 
 # Image/Video upload
 uploaded_file = st.file_uploader(
@@ -86,9 +93,9 @@ if uploaded_file is not None:
 
     # Load model
     try:
-        tsr = load_tsr(model_path)
+        recognizer = load_two_stage(model_path)
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error loading models: {e}")
         st.stop()
 
     if file_type == "image":
@@ -99,8 +106,8 @@ if uploaded_file is not None:
 
         # Run detection
         with st.spinner("Detecting traffic signs..."):
-            detections = tsr.process_frame(img_bgr, conf_threshold=conf_threshold)
-            result_img = tsr.draw_detections(img_bgr, detections)
+            dets = recognizer.predict_frame(img_bgr, yolo_conf=conf_threshold)
+            result_img = TwoStageSignRecognizer.draw(img_bgr, dets)
             result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
 
         # Show results (Compact Image View)
@@ -113,15 +120,26 @@ if uploaded_file is not None:
              st.image(result_img_rgb, caption="Detected Signs", use_container_width=True)
 
         # Show detection details and play audio alerts
-        if detections:
+        if dets:
             st.markdown("**Detected Signs:**")
-            for i, (cls_name, conf_score, bbox, area) in enumerate(detections):
-                x1, y1, x2, y2 = bbox
+            # List all detections for transparency
+            for i, d in enumerate(dets):
+                x1, y1, x2, y2 = d.bbox
+                cls_name = d.label
+                conf_score = d.conf
                 st.write(f"{i+1}. **{cls_name}** (Confidence: {conf_score:.2f}) [Box: ({x1},{y1})-({x2},{y2})]")
+
+            # Alert only the highest-confidence detection and skip fallback
+            try:
+                best_det = max(dets, key=lambda d: d.conf)
+            except Exception:
+                best_det = dets[0]
+
+            if best_det.label != "Generic Prohibitory Sign":
                 notification_handler.notify_traffic_sign(
-                    cls_name, 
-                    selected_languages, 
-                    visual_alert=enable_visual, 
+                    best_det.label,
+                    selected_languages,
+                    visual_alert=enable_visual,
                     audio_alert=enable_audio
                 )
         else:
@@ -159,9 +177,9 @@ if uploaded_file is not None:
             if not ret:
                 break
                 
-            # Detection
-            detections = tsr.process_frame(frame, conf_threshold=conf_threshold)
-            result_frame = tsr.draw_detections(frame, detections)
+            # Detection (two-stage)
+            dets = recognizer.predict_frame(frame, yolo_conf=conf_threshold)
+            result_frame = TwoStageSignRecognizer.draw(frame, dets)
             
             # Write
             out.write(result_frame)

@@ -1,15 +1,31 @@
 import streamlit as st
 import cv2
+def _laplacian_variance(img_bgr) -> float:
+    """
+    Compute Laplacian variance as a measure of blur.
+    Higher values indicate sharper images.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return 0.0
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
 import tempfile
 import time
 import numpy as np
 from pathlib import Path
-from ultralytics import YOLO
 import PIL.Image
 from notification_handler import NotificationHandler
+from two_stage_recognizer import TwoStageSignRecognizer
 
 # Configuration
-MODEL_PATH = "output/traffic_sign_model/weights/best.pt"
+MODEL_PATH = "output/traffic_sign_model/weights/best.pt"  # YOLO detector weights
+CNN_WEIGHTS = "output/cnn_classifier.pt"                   # CNN classifier weights
+CNN_CLASSES = "output/cnn_classes.json"                   # idx->class mapping
+CNN_CONF_THRESHOLD = 0.75                                  # Fallback threshold
+INSTANT_ALERT_CONF = 0.90                                  # Immediate alert if CNN confidence >= this
 LOGO_PATH = "assets/logo.png"  # Placeholder if you have one, or remove
 
 # Page Setup
@@ -84,51 +100,37 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def load_model():
-    """Load model with caching"""
-    if 'model' not in st.session_state:
-        try:
-            model_path_obj = Path(MODEL_PATH)
-            if not model_path_obj.exists():
-                st.error(f"Model not found at {MODEL_PATH}. Please train the model first.")
-                return None
-            st.session_state['model'] = YOLO(MODEL_PATH)
-            st.toast("Model loaded successfully!", icon="✅")
-        except Exception as e:
-            st.error(f"Failed to load model: {e}")
-            return None
-    return st.session_state['model']
+@st.cache_resource(show_spinner=True)
+def load_two_stage():
+    """Load YOLO detector and CNN classifier once (cached)."""
+    if not Path(MODEL_PATH).exists():
+        raise FileNotFoundError(f"YOLO weights not found at {MODEL_PATH}.")
+    if not Path(CNN_WEIGHTS).exists():
+        raise FileNotFoundError(
+            (
+                f"CNN weights not found at {CNN_WEIGHTS}. "
+                "Train it with train_cnn_classifier.py after running create_cnn_dataset.py."
+            )
+        )
+    recognizer = TwoStageSignRecognizer(
+        yolo_weights=MODEL_PATH,
+        cnn_weights=CNN_WEIGHTS,
+        classes_path=CNN_CLASSES,
+        classifier_threshold=CNN_CONF_THRESHOLD,
+    )
+    return recognizer
 
 def banner(message: str, container, side: str = "left"):
     """Render a compact visual banner in the given container."""
     color = "#2a5298" if side == "left" else "#8a2a2a"
     container.markdown(
         f"""
-        <div style="background:{color};color:#fff;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.2);
-                    font-family:system-ui;box-shadow:0 6px 18px -6px rgba(0,0,0,0.55);">
+        <div style="background:{color};color:#fff;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.2);\n                    font-family:system-ui;box-shadow:0 6px 18px -6px rgba(0,0,0,0.55);">
             {message}
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-def _laplacian_variance(img_roi: np.ndarray) -> float:
-    """
-    Blur score using Laplacian variance.
-    Higher is sharper; low variance indicates blur.
-    """
-    if img_roi is None or img_roi.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY) if img_roi.ndim == 3 else img_roi
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-def _is_prohibitory_class(name: str) -> bool:
-    """
-    Heuristic: Treat classes containing 'PROHIBITED' or starting with 'NO_' as prohibitory.
-    Prevents guessing specific prohibitory class under poor quality.
-    """
-    n = str(name).upper()
-    return ('PROHIBITED' in n) or n.startswith('NO_')
 
 def _roi_quality_ok(xyxy, frame_w, frame_h, frame_bgr, blur_threshold: float = 100.0) -> tuple[bool, float]:
     """
@@ -152,12 +154,13 @@ def _roi_quality_ok(xyxy, frame_w, frame_h, frame_bgr, blur_threshold: float = 1
         return (False, blur_score)
     return (True, blur_score)
 
-def process_video(video_path_or_cam, model, conf_threshold, iou_threshold, languages, play_audio=True):
+def process_video(video_path_or_cam, recognizer: TwoStageSignRecognizer, conf_threshold, iou_threshold, languages, play_audio=True):
     """
     Process video/camera frames and display results with temporal consistency and quality gates.
-    - Forces imgsz ≥ 1280 (maintains aspect ratio via letterbox inside YOLO)
-    - Uses confidence ≥ 0.8 (from F1-confidence analysis)
-    - Applies frame voting: accept a class only after ≥5 consecutive frames
+    - Forces imgsz >= 1280 (maintains aspect ratio via letterbox inside YOLO)
+    - Uses confidence >= 0.8 (from F1-confidence analysis)
+    - Applies frame voting: accept a class after >=5 consecutive frames
+    - Instant alert: if best detection CNN conf >= 0.90, alert immediately
     - Applies ROI quality gate to abstain on poor detections
     - Adds prohibitory family fallback to avoid guessing specific class
     """
@@ -204,59 +207,43 @@ def process_video(video_path_or_cam, model, conf_threshold, iou_threshold, langu
             
         # Inference (force high-resolution; keep aspect ratio via YOLO internals)
         start_time = time.time()
-        results = model.predict(frame, imgsz=max(1280, max(width, height)), conf=max(0.8, conf_threshold), iou=iou_threshold, verbose=False)
+        dets = recognizer.predict_frame(frame, yolo_conf=conf_threshold, yolo_iou=iou_threshold)
         end_time = time.time()
         inference_time = (end_time - start_time) * 1000
-        
-        # Visualize
-        annotated_frame = results[0].plot()
-        
-        # Track classes seen this frame
+
+        annotated_frame = TwoStageSignRecognizer.draw(frame, dets)
+
+        # Choose only the highest-confidence detection for alerting
+        best_det = None
+        if dets:
+            try:
+                best_det = max(dets, key=lambda d: d.conf)
+            except Exception:
+                best_det = dets[0]
+
+        # Track classes seen this frame (CNN labels)
         seen_this_frame = set()
-        frame_bgr = frame if isinstance(frame, np.ndarray) else annotated_frame
+        for d in dets:
+            seen_this_frame.add(d.label)
+            detections_log[d.label] = detections_log.get(d.label, 0) + 1
 
-        # Log detections with ROI quality and temporal voting
-        for box in results[0].boxes:
-            cls_id = int(box.cls[0])
-            cls_name = model.names[cls_id]
-            conf = float(box.conf[0]) if hasattr(box, 'conf') else 0.0
-            xyxy = list(map(float, box.xyxy[0].tolist()))
-
-            detections_log[cls_name] = detections_log.get(cls_name, 0) + 1
-            seen_this_frame.add(cls_name)
-
-            # ROI quality gate
-            ok, blur_score = _roi_quality_ok(xyxy, width, height, frame_bgr)
-            if not ok:
-                rejected_count += 1
-                # Overlay 'Unclear Sign' near the box to indicate abstention
-                x1, y1, _, _ = map(int, xyxy)
-                cv2.putText(annotated_frame, "Unclear Sign", (x1, max(0, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 64, 255), 2)
-                continue
-
-            # Prohibitory family fallback under poor quality / low confidence
-            if _is_prohibitory_class(cls_name) and (conf < 0.9):
-                # Behave conservatively: do not guess specific class
-                rejected_count += 1
-                x1, y1, _, _ = map(int, xyxy)
-                cv2.putText(annotated_frame, "Prohibitory Sign Ahead", (x1, max(0, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
-                # Visual alert only, avoid specific class audio to prevent wrong instruction
-                banner("🚫 Prohibitory Sign Ahead", alert_left, side="left")
-                continue
-
-            # Temporal consistency: require ≥5 consecutive frames to accept
-            class_streak[cls_name] = class_streak.get(cls_name, 0) + 1
-            stability_counter = max(stability_counter, class_streak[cls_name])
-            if class_streak[cls_name] >= 5:
-                if cls_name not in accepted_classes:
-                    accepted_classes.add(cls_name)
-                    accepted_count += 1
-                    # Debounced audio + visual alerts upon first acceptance
+            # Temporal acceptance logic with CNN labels
+            class_streak[d.label] = class_streak.get(d.label, 0) + 1
+            stability_counter = max(stability_counter, class_streak[d.label])
+            # Only alert on the highest-confidence detection and skip fallback
+            if best_det is not None and d is best_det and d.label != "Generic Prohibitory Sign":
+                # Instant alert if high confidence, or after temporal acceptance streak
+                should_alert = (d.conf >= INSTANT_ALERT_CONF) or (class_streak[d.label] >= 5)
+                if should_alert:
                     now = time.time()
-                    if now - last_alert_ts.get(cls_name, 0) > cooldown_s:
-                        notifier.notify_traffic_sign(cls_name, languages=languages, visual_alert=True, audio_alert=play_audio)
-                        banner(f"✅ {cls_name.replace('_',' ').title()} confirmed", alert_left, side="left")
-                        last_alert_ts[cls_name] = now
+                    if now - last_alert_ts.get(d.label, 0) > cooldown_s:
+                        notifier.notify_traffic_sign(d.label, languages=languages, visual_alert=True, audio_alert=play_audio)
+                        banner(f"✅ {d.label.replace('_',' ').title()} confirmed", alert_left, side="left")
+                        last_alert_ts[d.label] = now
+                    # Mark accepted when streak condition is met (for metrics and stability)
+                    if class_streak[d.label] >= 5 and d.label not in accepted_classes:
+                        accepted_classes.add(d.label)
+                        accepted_count += 1
 
         # Reset streaks for classes not observed in this frame
         for k in list(class_streak.keys()):
@@ -292,8 +279,8 @@ def main():
     
     with st.sidebar:
         st.header("Settings")
-        # Enforce conservative minimum confidence ≥ 0.8 (from F1-confidence analysis)
-        conf_threshold = st.slider("Confidence Threshold (min 0.8)", 0.8, 1.0, 0.8, 0.01)
+        # Confidence threshold (lower minimum to improve detection sensitivity)
+        conf_threshold = st.slider("Confidence Threshold", 0.1, 1.0, 0.5, 0.01)
         iou_threshold = st.slider("IoU Threshold", 0.0, 1.0, 0.45, 0.05)
         play_audio = st.toggle("Play Audio Alerts", value=True)
         languages = st.multiselect(
@@ -311,9 +298,9 @@ def main():
     # Start detection on either camera or uploaded video
     if use_camera:
         if st.button("Start Camera Detection", type="primary"):
-            model = load_model()
-            if model:
-                process_video(0, model, conf_threshold, iou_threshold, languages, play_audio)
+            recognizer = load_two_stage()
+            if recognizer:
+                process_video(0, recognizer, conf_threshold, iou_threshold, languages, play_audio)
     elif uploaded_file is not None:
         # Save to temp file
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -323,9 +310,9 @@ def main():
         st.video(video_path)
 
         if st.button("Start Detection", type="primary"):
-            model = load_model()
-            if model:
-                process_video(video_path, model, conf_threshold, iou_threshold, languages, play_audio)
+            recognizer = load_two_stage()
+            if recognizer:
+                process_video(video_path, recognizer, conf_threshold, iou_threshold, languages, play_audio)
 
 if __name__ == "__main__":
     main()
