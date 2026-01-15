@@ -1,0 +1,167 @@
+imgsz changed from 640 to 960
+date-26/12/2025 time:- 11.36 Am
+batch changed from 16 to 8
+python create_cnn_dataset.py --yolo-dataset Dataset --output cnn_dataset --yaml output/traffic_signs.yaml
+python train_cnn_classifier.py --data cnn_dataset --out output --epochs 25 --batch-size 32 --lr 0.001
+streamlit run streamlit_video_app.py
+streamlit run streamlit_app.py
+
+TRAFFIC SIGN RECOGNITION – AUGMENTATION ISSUES AND FIXES
+======================================================
+
+PROJECT CONTEXT
+---------------
+The YOLO-based traffic sign recognition model correctly detects traffic signs
+but frequently predicts the wrong class (mostly "gap in median").
+Bounding boxes are manually annotated and correct.
+
+ROOT CAUSE
+----------
+The issue is NOT feature extraction or YOLO architecture.
+The primary problem is aggressive and unrealistic data augmentation that
+destroys class-discriminative features of traffic signs.
+
+------------------------------------------------------
+PROBLEMS IDENTIFIED
+------------------------------------------------------
+
+1. Unrealistic Rotation
+-----------------------
+RandomRotate90 and large rotation angles (±15°, ±30°) were used.
+Traffic signs are never rotated by 90° in real-world scenarios.
+Orientation is a class-defining feature.
+
+Impact:
+- Model learns non-existent sign appearances
+- Confuses symbol orientation across classes
+
+2. Color Semantics Destroyed
+----------------------------
+HueSaturationValue with large limits was applied.
+Traffic sign colors (red, blue, yellow) are legally standardized.
+
+Impact:
+- Model loses ability to distinguish mandatory, cautionary, and prohibition signs
+- Severe class confusion occurs
+
+3. Shape Distortion
+-------------------
+GridDistortion and Perspective transforms were applied.
+Traffic signs are rigid, flat, and geometrically consistent.
+
+Impact:
+- Symbol geometry is corrupted
+- Model learns incorrect shape priors
+
+4. Weather Augmentations Cause Background Bias
+----------------------------------------------
+RandomRain, Fog, Shadow, and SunFlare were used.
+These affect background more than the sign itself.
+
+Impact:
+- Model associates road texture and environment with certain classes
+- Bias towards background-heavy classes like "gap in median"
+
+5. Bounding Box Integrity Risk
+------------------------------
+Albumentations can drop or shrink bounding boxes after augmentation.
+The code does not validate bbox count or size after transformation.
+
+Impact:
+- Bbox–class mismatch
+- Partial or tiny signs labeled as full objects
+- Confident but wrong predictions
+
+6. Over-Aggressive Oversampling
+-------------------------------
+Classes were force-augmented to 300 images regardless of original count.
+
+Impact:
+- Synthetic data dominates real data
+- Model overfits to augmented artifacts
+
+------------------------------------------------------
+WHAT NEEDS TO BE DONE (FIXES)
+------------------------------------------------------
+
+1. Restrict Augmentations to SAFE Transformations
+-------------------------------------------------
+Allowed:
+- Rotation limited to ±5 degrees
+- Small brightness and contrast changes
+- Mild Gaussian noise
+- Light blur (blur_limit ≤ 3)
+
+Remove Completely:
+- RandomRotate90
+- HueSaturationValue
+- Perspective / GridDistortion
+- Weather effects
+- ChannelShuffle
+- Grayscale conversion
+
+2. Enforce Bounding Box Validation
+----------------------------------
+Before saving augmented images:
+- Ensure number of bboxes == number of class labels
+- Reject bboxes with width or height < 5% of image
+- Reject partially visible or clipped signs
+
+3. Limit Augmentation Quantity
+------------------------------
+- Do NOT force all classes to equal size
+- Maximum augmentation should be 1.5x original data
+- Prefer real data over synthetic data
+
+4. Preserve Traffic Sign Semantics
+----------------------------------
+Augmentation must NOT:
+- Change sign color meaning
+- Alter symbol geometry
+- Modify orientation beyond realistic limits
+
+------------------------------------------------------
+EXPECTED RESULT AFTER FIXES
+------------------------------------------------------
+
+- Significant reduction in wrong class predictions
+- Less bias toward "gap in median"
+- Improved per-class precision
+- More stable and meaningful training convergence
+- Model learns sign symbols instead of background context
+
+------------------------------------------------------
+FINAL NOTE
+------------------------------------------------------
+Feature extraction is already handled by YOLO.
+Improving data quality and realistic augmentation is the correct solution.
+
+
+
+
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="Traffic Sign Recognition Training")
+#     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
+#     parser.add_argument("--batch", type=int, default=16, help="Batch size")
+#     parser.add_argument("--imgsz", type=int, default=960, help="Image size")
+#     parser.add_argument("--device", type=str, default="auto", help="Device (cpu, cuda, 0, etc)")
+#     parser.add_argument("--workers", type=int, default=2, help="Number of data loading workers")
+Transferred 493/499 items from pretrained weights
+Freezing layer 'model.23.dfl.conv.weight'
+AMP: running Automatic Mixed Precision (AMP) checks...
+AMP: checks passed 
+train: Fast image access  (ping: 0.10.0 ms, read: 165.1226.3 MB/s, size: 424.4 KB)
+train: Scanning D:\Traffic-Sign\Traffic_Sign\output\train\labels... 3426 images, 2 backgrounds, 0
+train: New cache created: D:\Traffic-Sign\Traffic_Sign\output\train\labels.cache
+albumentations: Blur(p=0.01, blur_limit=(3, 7)), MedianBlur(p=0.01, blur_limit=(3, 7)), ToGray(p=0.01, method='weighted_average', num_output_channels=3), CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8))
+val: Fast image access  (ping: 0.10.0 ms, read: 36.362.0 MB/s, size: 4.4 KB)
+val: Scanning D:\Traffic-Sign\Traffic_Sign\output\val\labels... 504 images, 0 backgrounds, 0 corr
+val: New cache created: D:\Traffic-Sign\Traffic_Sign\output\val\labels.cache
+Plotting labels to output\traffic_sign_model\labels.jpg... 
+
+
+
+27/12/25
+WARNING: 5 classes have zero crops: ['ACCIDENT_PRONE_AREA', 'CYCLE_ROOT_AHEAD', 'GO_SLOW', 'INTERSECTION', 'U_TURN']
+Hint: Use --source yolo-output to align IDs with YAML; avoid raw mode unless --strict-raw-check is enabled.
+Done. Images scanned: 4907, crops saved: 4364. Output: cnn_dataset

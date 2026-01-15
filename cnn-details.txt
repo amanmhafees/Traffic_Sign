@@ -1,0 +1,210 @@
+Great — this is a **solid two-stage design** now. I’ll answer exactly what you asked, in a **clear, structured, project-ready way**.
+
+---
+
+# 1️⃣ CNN MODEL USED (SECOND STAGE)
+
+You are using:
+
+> **ResNet-18 (ImageNet pre-trained)**
+> as a **fine-grained traffic sign classifier** on cropped YOLO ROIs.
+
+This is a **correct and appropriate choice** for your problem.
+
+---
+
+# 2️⃣ CNN ARCHITECTURE DETAILS (LAYERS)
+
+### 🔹 Backbone: ResNet-18
+
+ResNet-18 consists of:
+
+| Stage           | Layers                             |
+| --------------- | ---------------------------------- |
+| Input           | 224 × 224 × 3                      |
+| Conv1           | 7×7 Conv, 64 filters, stride 2     |
+| MaxPool         | 3×3, stride 2                      |
+| Block 1         | 2 × Residual blocks (64 channels)  |
+| Block 2         | 2 × Residual blocks (128 channels) |
+| Block 3         | 2 × Residual blocks (256 channels) |
+| Block 4         | 2 × Residual blocks (512 channels) |
+| Global Avg Pool | 512 → 1                            |
+| Fully Connected | **512 → N classes**                |
+
+### 🔹 Custom modification (YOU DID THIS CORRECTLY)
+
+```python
+in_features = model.fc.in_features
+model.fc = nn.Linear(in_features, num_classes)
+```
+
+✔ This replaces ImageNet’s 1000-class head with your traffic-sign classes
+✔ Only the **final FC layer is trained from scratch**
+
+---
+
+# 3️⃣ CNN TRAINING HYPERPARAMETERS (USED)
+
+### 🔧 Training configuration
+
+| Parameter        | Value            |
+| ---------------- | ---------------- |
+| Model            | ResNet-18        |
+| Pretrained       | ImageNet         |
+| Input size       | 224 × 224        |
+| Optimizer        | Adam             |
+| Learning rate    | **1e-3**         |
+| Loss function    | CrossEntropyLoss |
+| Batch size       | **32**           |
+| Epochs           | **25**           |
+| Validation split | **20%**          |
+| Device           | CUDA (RTX 3050)  |
+
+---
+
+# 4️⃣ DATA PREPROCESSING & AUGMENTATION (CNN)
+
+### ✅ Training transforms
+
+```python
+Resize → 224×224
+ColorJitter(brightness=0.15, contrast=0.15)
+Normalize(ImageNet mean/std)
+```
+
+✔ Correct: **mild augmentation only**
+✔ Preserves sign geometry
+✔ Avoids semantic corruption
+
+### ❌ Correctly avoided
+
+* Rotation
+* Hue/Saturation shift
+* Perspective warp
+* Grayscale
+
+---
+
+# 5️⃣ INFERENCE LOGIC (WHY YOU SEE “GENERIC PROHIBITORY SIGN”)
+
+Your inference logic:
+
+```python
+if conf_val < classifier_threshold:
+    label = "Generic Prohibitory Sign"
+```
+
+With:
+
+```python
+classifier_threshold = 0.75
+```
+
+### What’s happening:
+
+* CNN **is predicting classes**
+* But confidence is often **< 0.75**
+* So fallback overrides correct labels
+
+This is **expected behavior**, not a bug.
+
+---
+
+# 6️⃣ MOST IMPORTANT ISSUE (ROOT CAUSE)
+
+### 🔴 CNN DATASET MISALIGNMENT (CRITICAL)
+
+You already diagnosed it correctly:
+
+> ❌ CNN dataset is **misplaced and not matching sign folders**
+> ❌ Some classes missing
+> ❌ IDs in YOLO ≠ CNN folder structure
+
+### Why this breaks learning:
+
+* `ImageFolder` assigns labels **by folder name**
+* CNN never sees consistent class boundaries
+* Model learns **wrong associations**
+* Confidence stays low → fallback triggers
+
+📌 **CNN does NOT use YOLO IDs**
+📌 It uses **folder names only**
+
+---
+
+# 7️⃣ WHY SPEED LIMIT vs LOAD LIMIT CONFUSION HAPPENS
+
+This is a **classic vision problem**, not your fault.
+
+### Both signs contain:
+
+* Numbers
+* Circular borders
+* Similar contrast
+
+### Key difference (CNN is missing):
+
+* **LOAD LIMIT** → number + “t” / weight symbol
+* **SPEED LIMIT** → plain number only
+
+### Why CNN fails:
+
+* Crops are too tight
+* Symbol detail is lost
+* Dataset imbalance
+* Too few load-limit examples
+
+📌 Solution (later):
+
+* Slightly looser crop
+* Ensure load-limit symbols are visible
+* Add **class-specific hard negatives**
+
+---
+
+# 8️⃣ HYPERPARAMETERS SUMMARY (FOR REPORT)
+
+You can **copy-paste this**:
+
+> The second-stage classifier is based on a ResNet-18 architecture pre-trained on ImageNet. Input images are resized to 224×224 and normalized using ImageNet statistics. The final fully connected layer is replaced to match the number of traffic sign classes. The network is trained using the Adam optimizer with a learning rate of 1e-3, batch size of 32, and categorical cross-entropy loss for 25 epochs. Mild brightness and contrast augmentation is applied to improve robustness while preserving sign semantics.
+
+---
+
+# 9️⃣ WHAT TO FIX NEXT (IN ORDER)
+
+### 🔧 Mandatory fixes
+
+1. **Rebuild CNN dataset**
+
+   * Crop using YOLO bbox
+   * Folder name = sign name
+2. Remove missing classes
+3. Verify `cnn_classes.json`
+
+### 🔧 Optional improvements
+
+* Lower CNN threshold to `0.6`
+* Add temporal voting
+* Increase CNN epochs to 40
+
+---
+
+# 10️⃣ FINAL VERDICT
+
+✅ Architecture — **correct**
+✅ Model choice — **correct**
+✅ Hyperparameters — **reasonable**
+❌ Dataset alignment — **currently breaking performance**
+
+Once dataset is fixed:
+
+> **This system will work extremely well**
+
+If you want next, I can:
+
+* Give a **CNN dataset validator script**
+* Give a **confidence calibration strategy**
+* Fix speed-vs-load confusion
+* Add temporal voting logic
+
+Just tell me 👍
