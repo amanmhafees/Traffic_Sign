@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 import streamlit as st  # Import Streamlit for visual notifications
 import time  # For controlling the display duration of the notification
+import base64
 import os
 import shutil  # For ffmpeg detection
 try:
@@ -249,6 +250,46 @@ class NotificationHandler:
                 logger.warning(f"Async playback failed for {audio_path.name}: {e}")
         threading.Thread(target=_runner, daemon=True).start()
 
+    def _autoplay_in_browser(self, audio_path: Path) -> bool:
+        """
+        Try autoplay in the Streamlit client browser.
+        Returns True if autoplay widget/tag was injected successfully.
+        """
+        try:
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+        except Exception as e:
+            logger.warning(f"Unable to read audio for browser autoplay ({audio_path.name}): {e}")
+            return False
+
+        # Preferred path: native Streamlit audio with autoplay if supported.
+        try:
+            st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+            logger.debug(f"Autoplay via st.audio started: {audio_path.name}")
+            return True
+        except TypeError:
+            # Older Streamlit versions may not support autoplay parameter.
+            pass
+        except Exception as e:
+            logger.warning(f"st.audio autoplay failed ({audio_path.name}): {e}")
+
+        # Fallback: inject a hidden HTML audio element.
+        try:
+            b64 = base64.b64encode(audio_bytes).decode("ascii")
+            st.markdown(
+                f"""
+                <audio autoplay playsinline preload="auto" style="display:none;">
+                    <source src="data:audio/mp3;base64,{b64}" type="audio/mpeg">
+                </audio>
+                """,
+                unsafe_allow_html=True,
+            )
+            logger.debug(f"Autoplay via HTML audio tag started: {audio_path.name}")
+            return True
+        except Exception as e:
+            logger.warning(f"HTML audio autoplay failed ({audio_path.name}): {e}")
+            return False
+
     def _background_autoplay(self, first_path: Path) -> bool:
         """
         Unified background autoplay attempt.
@@ -317,26 +358,76 @@ class NotificationHandler:
             st.warning(f"No audio files found for {phrase}. Expected pattern: {detected_sign}_<lang>.mp3")
             return
 
-        # Background autoplay of first selected language if possible
-        first_lang, first_path = preferred_first
-        autoplay_success = False
-        if self.background_autoplay:
-            autoplay_success = self._background_autoplay(first_path)
-        self._last_autoplay_ok = autoplay_success
+        # Try browser autoplay first; fallback to local server-side playback.
+        # first_lang, first_path = preferred_first
+        # autoplay_success = False
+        # if self.background_autoplay:
+        #     autoplay_success = self._autoplay_in_browser(first_path)
+        #     if not autoplay_success:
+        #         autoplay_success = self._background_autoplay(first_path)
+        # self._last_autoplay_ok = autoplay_success
 
-        if not autoplay_success:
-            # Show player for first always if autoplay not successful
-            try:
-                with open(first_path, "rb") as f:
-                    st.audio(f.read(), format="audio/mp3")
-            except Exception as e:
-                logger.error(f"Autoplay/inline fallback failed for {first_path.name}: {e}")
+        # if not autoplay_success:
+        #     # Show player for first always if autoplay not successful
+        #     try:
+        #         with open(first_path, "rb") as f:
+        #             st.audio(f.read(), format="audio/mp3")
+        #     except Exception as e:
+        #         logger.error(f"Autoplay/inline fallback failed for {first_path.name}: {e}")
+        # ALWAYS play first language using Streamlit (browser audio)
+        first_lang, first_path = preferred_first
+
+        # try:
+        #     with open(first_path, "rb") as f:
+        #         st.audio(f.read(), format="audio/mp3")
+        #     st.caption(f"{first_lang} (primary audio)")
+        # except Exception as e:
+        #     logger.error(f"Failed to play first audio: {e}")
+
+        # first_lang, first_path = preferred_first
+
+        # import base64
+        # with open(first_path, "rb") as f:
+        #     b64 = base64.b64encode(f.read()).decode()
+
+        # st.markdown(f"""
+        # <audio autoplay playbackRate="1.5">
+        #     <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        # </audio>
+        # """, unsafe_allow_html=True)
+
+        # st.caption(f"{first_lang} (auto)")
+        first_lang, first_path = preferred_first
+
+        import base64
+        with open(first_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+
+        audio_html = f"""
+        <audio id="main_audio" autoplay>
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        </audio>
+
+        <script>
+        setTimeout(function() {{
+            var audio = document.getElementById("main_audio");
+            if (audio) {{
+                audio.playbackRate = 1.5;  // 🔥 speed control
+            }}
+        }}, 100);
+        </script>
+        """
+
+        st.markdown(audio_html, unsafe_allow_html=True)
+        st.caption(f"{first_lang} (auto)")
+
 
         # Decide which entries to display as players
-        if autoplay_success and self.hide_autoplay_player:
-            display_entries = found_entries[1:]
-        else:
-            display_entries = found_entries
+        # if autoplay_success and self.hide_autoplay_player:
+        #     display_entries = found_entries[1:]
+        # else:
+        #     display_entries = found_entries
+        display_entries = found_entries[1:]
 
         # Only show the "Audio Files" headers if we have entries to show
         if display_entries:
@@ -348,8 +439,8 @@ class NotificationHandler:
                         with cols[i % len(cols)]:
                             st.audio(f.read(), format="audio/mp3")
                             tag = ""
-                            if autoplay_success and lang == first_lang:
-                                tag = " (auto)"
+                            # if autoplay_success and lang == first_lang:
+                            #     tag = " (auto)"
                             st.caption(lang + tag)
                 except Exception as e:
                     logger.warning(f"Could not load audio player for {path.name}: {e}")
